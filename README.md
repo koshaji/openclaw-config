@@ -1,7 +1,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/OpenClaw-Config-D97757?style=for-the-badge&labelColor=1a1a2e" alt="OpenClaw Config">
   <br><br>
-  <a href="https://github.com/TechNickAI/openclaw-config/releases"><img src="https://img.shields.io/badge/version-0.14.0-D97757?style=flat-square" alt="Version"></a>
+  <a href="https://github.com/TechNickAI/openclaw-config/releases"><img src="https://img.shields.io/badge/version-0.15.0-D97757?style=flat-square" alt="Version"></a>
   <img src="https://img.shields.io/badge/python-3.11+-3776ab?style=flat-square&logo=python&logoColor=white" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License">
   <a href="https://github.com/TechNickAI/openclaw-config/stargazers"><img src="https://img.shields.io/github/stars/TechNickAI/openclaw-config?style=flat-square&color=D97757" alt="Stars"></a>
@@ -107,20 +107,20 @@ Each skill is a standalone [UV script](https://docs.astral.sh/uv/guides/scripts/
 Python with inline dependencies, no project-level setup. Run directly, version
 independently.
 
-| Skill                    | What it does                                             | Version |
-| ------------------------ | -------------------------------------------------------- | ------- |
-| **parallel**             | Web search & content extraction via Parallel.ai          | 0.2.0   |
-| **quo**                  | Business phone — calls, texts, voicemails, contacts, SMS | 0.6.0   |
-| **fireflies**            | Search meeting transcripts & action items                | 0.2.0   |
-| **limitless**            | Query Pendant lifelogs & conversations                   | 0.2.0   |
-| **asana**                | Task & project management via MCP                        | 0.1.0   |
-| **followupboss**         | Real estate CRM — contacts, deals, pipeline              | 0.1.0   |
-| **librarian**            | Curate and maintain the knowledge base                   | 0.2.0   |
-| **create-great-prompts** | Prompt engineering for LLM agents                        | 2.0.0   |
-| **smart-delegation**     | Route work to Opus, Grok, or handle directly             | 0.1.0   |
-| **workflow-builder**     | Design new autonomous workflows                          | 0.1.0   |
-| **gateway-restart**      | Graceful gateway restart — waits for active work         | 0.1.0   |
-| **openclaw**             | Install, update, and health-check the config             | 0.2.2   |
+| Skill                    | What it does                                                           | Version |
+| ------------------------ | ---------------------------------------------------------------------- | ------- |
+| **parallel**             | Web search, extraction, deep research & enrichment via Parallel.ai CLI | 0.3.0   |
+| **quo**                  | Business phone — calls, texts, voicemails, contacts, SMS               | 0.6.0   |
+| **fireflies**            | Search meeting transcripts & action items                              | 0.2.0   |
+| **limitless**            | Query Pendant lifelogs & conversations                                 | 0.2.0   |
+| **asana**                | Task & project management via MCP                                      | 0.1.0   |
+| **followupboss**         | Real estate CRM — contacts, deals, pipeline                            | 0.1.0   |
+| **librarian**            | Curate and maintain the knowledge base                                 | 0.2.0   |
+| **create-great-prompts** | Prompt engineering for LLM agents                                      | 2.0.0   |
+| **smart-delegation**     | Route work to Opus, Grok, or handle directly                           | 0.1.0   |
+| **workflow-builder**     | Design new autonomous workflows                                        | 0.1.0   |
+| **gateway-restart**      | Graceful gateway restart — waits for active work                       | 0.1.0   |
+| **openclaw**             | Install, update, and health-check the config                           | 0.2.2   |
 
 ## Workflows
 

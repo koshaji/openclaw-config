@@ -150,8 +150,11 @@ Scan for leaked secrets. This runs during every audit and drift check.
 1. **OpenClaw config** — `~/.openclaw/` files and their permissions
 2. **Other config directories** — `~/.config/`, `~/.netrc`
 3. **Shell history** — `~/.bash_history`, `~/.zsh_history`
-4. **Git history** — In the OpenClaw workspace, check for accidentally committed
-   secrets: `git log --diff-filter=A --name-only -- '*.env' '*.key' '*.pem'`
+4. **Git history** — In the OpenClaw workspace, scan commit content for leaked secrets:
+   `git log -p --all -S 'sk-ant-' -S 'AKIA' -S 'ghp_' -S 'sk-' 2>/dev/null | head -200`
+   This scans actual content across all commits — not just filenames — and catches
+   secrets added to any file (README, JSON config, etc.), not only newly-added
+   `.env`/`.key`/`.pem` files.
 5. **Log files** — Check gateway logs and health check logs for accidentally logged
    credentials matching the patterns above
 6. **Process environment** — Check for secrets exposed in process env vars. Report the
@@ -249,11 +252,20 @@ skill can do anything the user can do.
 
 ### Script Integrity
 
-- Compare skill scripts against the upstream openclaw-config repo:
-  `git diff HEAD -- skills/` in the config directory. Any local modifications are
-  findings.
-- Check file modification timestamps against git history — a script modified after its
-  last commit is suspicious.
+Skills run from two locations that must both be checked:
+
+1. **Config repo** (`~/.openclaw-config/skills/` or wherever the repo is cloned): Run
+   `git diff HEAD -- skills/` — any local modifications are findings.
+2. **Deployed workspace copies** (the actual executables that run): The openclaw
+   deployment model copies skills to the workspace. Check those copies too:
+   - Find the workspace skills directory (read `CLAUDE.local.md` for the path)
+   - Compare each deployed skill against the corresponding config repo file:
+     `diff <workspace>/skills/<name>/<name> <config-repo>/skills/<name>/<name>`
+   - A tampered deployed skill that leaves the config repo untouched will not show in
+     `git diff` — this check catches it.
+
+- Check file modification timestamps — a script modified more recently than the config
+  repo's last `git pull` is suspicious.
 - Verify file permissions — skill scripts should be executable (`755`) but not
   SUID/SGID.
 
@@ -419,9 +431,13 @@ results as the baseline. The baseline captures:
 - Firewall rules
 - Cron jobs (system and OpenClaw)
 - MCP servers and tool descriptions (with hashes for change detection)
-- Skill script checksums (for integrity verification)
-- Active network connections
-- Process list
+- Skill script checksums for both config repo and deployed copies
+
+Active network connections and running processes are **not** included in the baseline —
+they change constantly on healthy machines (SSH sessions, browsers, cron jobs) and would
+generate continuous false positives on every drift check. These are checked during
+`audit` and `redteam` for anomalies, but compared against behavioral patterns rather
+than a snapshot.
 
 In interactive mode, walk through the baseline with the human: "Here's your current
 security state. Anything here you want to change before I lock this in as the baseline?"

@@ -129,12 +129,12 @@ When a finding needs verification across machines:
 
 Severity determines notification timing:
 
-| Severity       | Criteria                                                                        | Action                                                                         |
-| -------------- | ------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| **CRITICAL**   | Active exploitation in the wild AND we are confirmed exposed                    | Immediate notification to admin. Auto-apply mitigation if safe and reversible. |
-| **HIGH**       | Known technique, we are likely vulnerable, exploitation is feasible             | Notify admin within the hour. Detailed report with recommended actions.        |
-| **MEDIUM**     | Theoretical risk, partial exposure, or exploitation requires unusual conditions | Include in next daily sweep notification. Log to findings.                     |
-| **LOW / INFO** | Interesting research, we are mitigated, or not applicable                       | Log to `agent_notes.md`. Include in weekly digest.                             |
+| Severity       | Criteria                                                                        | Action                                                                                                                                                                             |
+| -------------- | ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **CRITICAL**   | Active exploitation in the wild AND we are confirmed exposed                    | Immediate notification to admin with detailed findings and recommended steps. All remediation runs through machine-security-review on each machine — never apply changes remotely. |
+| **HIGH**       | Known technique, we are likely vulnerable, exploitation is feasible             | Notify admin within the hour. Detailed report with recommended actions.                                                                                                            |
+| **MEDIUM**     | Theoretical risk, partial exposure, or exploitation requires unusual conditions | Include in next daily sweep notification. Log to findings.                                                                                                                         |
+| **LOW / INFO** | Interesting research, we are mitigated, or not applicable                       | Log to `agent_notes.md`. Include in weekly digest.                                                                                                                                 |
 
 Use the admin lane from `notification-routing.md`. Read `~/.openclaw/health-check-admin`
 for the notification command. Include the affected machine name (or "fleet-wide" for

@@ -5,7 +5,7 @@
   <img src="https://img.shields.io/badge/python-3.11+-3776ab?style=flat-square&logo=python&logoColor=white" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License">
   <a href="https://github.com/TechNickAI/openclaw-config/stargazers"><img src="https://img.shields.io/github/stars/TechNickAI/openclaw-config?style=flat-square&color=D97757" alt="Stars"></a>
-  <img src="https://img.shields.io/badge/skills-12-blueviolet?style=flat-square" alt="Skills">
+  <img src="https://img.shields.io/badge/skills-13-blueviolet?style=flat-square" alt="Skills">
   <a href="https://github.com/TechNickAI/openclaw-config/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square" alt="PRs Welcome"></a>
 </p>
 
@@ -77,6 +77,7 @@ openclaw-config/
 ├── skills/             # Standalone UV scripts — no install needed
 │   ├── parallel/       # Web research & content extraction
 │   ├── quo/            # Business phone — calls, texts, contacts
+│   ├── fathom/         # Meeting recording & transcript search
 │   ├── fireflies/      # Meeting transcript search
 │   ├── limitless/      # Pendant lifelog search
 │   ├── asana/          # Task & project management
@@ -114,6 +115,7 @@ independently.
 | ------------------------ | ---------------------------------------------------------------------- | ------- |
 | **parallel**             | Web search, extraction, deep research & enrichment via Parallel.ai CLI | 0.3.0   |
 | **quo**                  | Business phone — calls, texts, voicemails, contacts, SMS               | 0.6.0   |
+| **fathom**               | Query meeting recordings — transcripts, summaries, action items        | 0.1.0   |
 | **fireflies**            | Search meeting transcripts & action items                              | 0.2.0   |
 | **limitless**            | Query Pendant lifelogs & conversations                                 | 0.2.0   |
 | **asana**                | Task & project management via MCP                                      | 0.1.0   |

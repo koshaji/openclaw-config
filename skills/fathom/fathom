@@ -1,0 +1,483 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["httpx>=0.28"]
+# ///
+"""
+Fathom CLI - Query your meeting recordings via REST API
+
+Requires FATHOM_API_KEY environment variable for API operations.
+"""
+
+import json
+import os
+import re
+import sys
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, NoReturn
+from urllib.parse import urlencode
+
+import httpx
+
+API_BASE = "https://api.fathom.ai/external/v1"
+MAX_LIMIT = 50
+DEFAULT_LIMIT = 5
+
+
+# --- Helpers ---
+
+
+def get_api_key() -> str | None:
+    """Get API key from environment."""
+    return os.environ.get("FATHOM_API_KEY", "").strip() or None
+
+
+def error(message: str, hint: str | None = None) -> NoReturn:
+    """Print error message to stderr and exit."""
+    print(f"Error: {message}", file=sys.stderr)
+    if hint:
+        print(hint, file=sys.stderr)
+    sys.exit(1)
+
+
+def api_get(path: str, params: dict[str, Any] | None = None) -> Any:
+    """Execute a GET request against the Fathom API."""
+    api_key = get_api_key()
+    if not api_key:
+        error(
+            "FATHOM_API_KEY not set",
+            "Get your key from: https://fathom.video → User Settings → API Access",
+        )
+
+    headers = {
+        "X-Api-Key": api_key,
+        "Accept": "application/json",
+    }
+
+    url = f"{API_BASE}{path}"
+    if params:
+        filtered = {k: v for k, v in params.items() if v is not None}
+        if filtered:
+            url = f"{url}?{urlencode(filtered, doseq=True)}"
+
+    try:
+        response = httpx.get(url, headers=headers, timeout=60.0)
+        response.raise_for_status()
+        data = response.json()
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 429:
+            error("Rate limited", "Fathom allows 60 API calls per minute.")
+        if e.response.status_code == 401:
+            error("Authentication failed", "Check your FATHOM_API_KEY is valid.")
+        try:
+            body = e.response.json()
+            msg = body.get("error") or body.get("message") or str(body)
+        except Exception:
+            msg = e.response.text or str(e)
+        error(f"API returned HTTP {e.response.status_code}", str(msg))
+    except httpx.RequestError as e:
+        error("Failed to reach Fathom API", str(e))
+    except json.JSONDecodeError:
+        error("API returned invalid JSON", f"Response: {response.text[:200]}")
+
+    return data
+
+
+def fetch_meetings(params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Fetch meetings from the API, extracting from the 'items' wrapper."""
+    data = api_get("/meetings", params)
+    if isinstance(data, dict):
+        return data.get("items") or []
+    if isinstance(data, list):
+        return data
+    return []
+
+
+def validate_limit(value: str) -> int:
+    """Validate and return limit value (1-50)."""
+    try:
+        limit = int(value)
+    except ValueError:
+        error(f"Limit must be a number, got '{value}'")
+    if limit < 1 or limit > MAX_LIMIT:
+        error(f"Limit must be between 1-50, got {limit}")
+    return limit
+
+
+def validate_date(value: str) -> str:
+    """Validate YYYY-MM-DD date format and that the date is real."""
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", value):
+        error(f"Invalid date format: '{value}'", "Expected format: YYYY-MM-DD")
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        error(f"Invalid date: '{value}'", "Expected format: YYYY-MM-DD")
+    return value
+
+
+# --- Formatters ---
+
+
+def format_timestamp(ts: str | None) -> str:
+    """Format an ISO timestamp to a readable string."""
+    if not ts:
+        return ""
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d %H:%M UTC")
+    except (ValueError, TypeError):
+        return str(ts)
+
+
+def format_duration(start: str | None, end: str | None) -> str:
+    """Calculate duration from start/end timestamps."""
+    if not start or not end:
+        return "unknown"
+    try:
+        s = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        e = datetime.fromisoformat(end.replace("Z", "+00:00"))
+        minutes = int((e - s).total_seconds() / 60)
+        return f"{minutes}m"
+    except (ValueError, TypeError):
+        return "unknown"
+
+
+def format_list(meetings: list[dict[str, Any]]) -> str:
+    """Format meeting list results as markdown."""
+    if not meetings:
+        return "No meetings found."
+
+    output = []
+    for m in meetings:
+        title = m.get("title") or m.get("meeting_title") or "Untitled"
+        mid = m.get("recording_id", "")
+        created = format_timestamp(m.get("created_at"))
+        meeting_type = m.get("calendar_invitees_domains_type") or ""
+        duration = format_duration(
+            m.get("recording_start_time"), m.get("recording_end_time")
+        )
+        url = m.get("url") or ""
+
+        # Invitees
+        invitees = m.get("calendar_invitees") or []
+        invitee_names = [
+            i.get("name") or i.get("email") or "unknown" for i in invitees
+        ]
+
+        # Recorded by
+        recorded_by = m.get("recorded_by") or {}
+        recorder = recorded_by.get("name") or recorded_by.get("email") or ""
+
+        # Summary (included when requested via include_summary=true)
+        summary = m.get("default_summary") or {}
+        summary_text = summary.get("markdown_formatted") or ""
+
+        # Action items
+        action_items = m.get("action_items") or []
+
+        output.append(f"## {title}")
+        output.append(f"**ID:** {mid}")
+        if created:
+            output.append(f"**Date:** {created}")
+        output.append(f"**Duration:** {duration}")
+        if meeting_type:
+            output.append(f"**Type:** {meeting_type}")
+        if recorder:
+            output.append(f"**Recorded by:** {recorder}")
+        if invitee_names:
+            output.append(f"**Invitees:** {', '.join(invitee_names)}")
+        if url:
+            output.append(f"**URL:** {url}")
+        output.append("")
+
+        if summary_text:
+            output.append("### Summary")
+            output.append(summary_text)
+            output.append("")
+
+        if action_items:
+            output.append("### Action Items")
+            for item in action_items:
+                desc = item.get("description") or ""
+                completed = item.get("completed", False)
+                checkbox = "[x]" if completed else "[ ]"
+                assignee = item.get("assignee") or {}
+                assignee_name = assignee.get("name") or ""
+                suffix = f" (@{assignee_name})" if assignee_name else ""
+                output.append(f"- {checkbox} {desc}{suffix}")
+            output.append("")
+
+        output.append("---")
+        output.append("")
+
+    return "\n".join(output)
+
+
+def format_transcript(meeting: dict[str, Any]) -> str:
+    """Format a single meeting with full transcript detail."""
+    if not meeting:
+        return "Meeting not found."
+
+    title = meeting.get("title") or meeting.get("meeting_title") or "Untitled"
+    created = format_timestamp(meeting.get("created_at"))
+    duration = format_duration(
+        meeting.get("recording_start_time"), meeting.get("recording_end_time")
+    )
+    meeting_type = meeting.get("calendar_invitees_domains_type") or ""
+    url = meeting.get("url") or ""
+
+    recorded_by = meeting.get("recorded_by") or {}
+    recorder = recorded_by.get("name") or recorded_by.get("email") or "unknown"
+
+    invitees = meeting.get("calendar_invitees") or []
+    invitee_names = [i.get("name") or i.get("email") or "unknown" for i in invitees]
+
+    output = [f"# {title}"]
+    if created:
+        output.append(f"**Date:** {created}")
+    output.append(f"**Duration:** {duration}")
+    if meeting_type:
+        output.append(f"**Type:** {meeting_type}")
+    output.append(f"**Recorded by:** {recorder}")
+    if invitee_names:
+        output.append(f"**Invitees:** {', '.join(invitee_names)}")
+    if url:
+        output.append(f"**URL:** {url}")
+    output.append("")
+
+    # Summary
+    summary = meeting.get("default_summary") or {}
+    summary_text = summary.get("markdown_formatted") or ""
+    if summary_text:
+        output.append("## Summary")
+        output.append(summary_text)
+        output.append("")
+
+    # Action items
+    action_items = meeting.get("action_items") or []
+    if action_items:
+        output.append("## Action Items")
+        for item in action_items:
+            desc = item.get("description") or ""
+            completed = item.get("completed", False)
+            checkbox = "[x]" if completed else "[ ]"
+            assignee = item.get("assignee") or {}
+            assignee_name = assignee.get("name") or ""
+            suffix = f" (@{assignee_name})" if assignee_name else ""
+            output.append(f"- {checkbox} {desc}{suffix}")
+        output.append("")
+
+    # Transcript — segments have nested speaker object
+    transcript = meeting.get("transcript") or []
+    if transcript:
+        output.append("## Transcript")
+        for segment in transcript:
+            # Speaker is nested: {"speaker": {"display_name": "..."}, "text": "...", "timestamp": "HH:MM:SS"}
+            speaker_obj = segment.get("speaker") or {}
+            speaker = speaker_obj.get("display_name") or "Speaker"
+            text = segment.get("text") or ""
+            ts = segment.get("timestamp") or ""
+            ts_str = f" [{ts}]" if ts else ""
+            output.append(f"**{speaker}**{ts_str}: {text}")
+        output.append("")
+
+    return "\n".join(output)
+
+
+# --- Commands ---
+
+
+def cmd_recent(args: list[str]) -> None:
+    """List recent meetings."""
+    limit = DEFAULT_LIMIT
+    if args:
+        limit = validate_limit(args[0])
+
+    meetings = fetch_meetings({"limit": limit})
+    print(format_list(meetings[:limit]))
+
+
+def cmd_today(args: list[str]) -> None:
+    """Get today's meeting recordings."""
+    now = datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    meetings = fetch_meetings({
+        "created_after": today_start.isoformat(),
+        "limit": 20,
+    })
+    print(format_list(meetings))
+
+
+def cmd_date(args: list[str]) -> None:
+    """Get meetings for a specific date."""
+    if not args:
+        error("Date required", "Usage: fathom date YYYY-MM-DD")
+
+    date_str = validate_date(args[0])
+    next_day = (date.fromisoformat(date_str) + timedelta(days=1)).isoformat()
+
+    meetings = fetch_meetings({
+        "created_after": f"{date_str}T00:00:00Z",
+        "created_before": f"{next_day}T00:00:00Z",
+        "limit": 20,
+    })
+    print(format_list(meetings))
+
+
+def cmd_search(args: list[str]) -> None:
+    """Search meetings by title keyword.
+
+    Fathom doesn't have a dedicated search endpoint, so we fetch recent meetings
+    and filter by keyword in the title. This is a client-side search.
+    """
+    if not args:
+        error("Search query required", 'Usage: fathom search "your query"')
+
+    keyword = " ".join(args).lower()
+
+    meetings = fetch_meetings({"limit": MAX_LIMIT})
+
+    # Client-side filter — search title and invitee names
+    matched = []
+    for m in meetings:
+        title = (m.get("title") or m.get("meeting_title") or "").lower()
+        invitees = m.get("calendar_invitees") or []
+        invitee_text = " ".join(
+            (i.get("name") or "") + " " + (i.get("email") or "")
+            for i in invitees
+        ).lower()
+        if keyword in title or keyword in invitee_text:
+            matched.append(m)
+
+    result = format_list(matched)
+    if len(meetings) >= MAX_LIMIT:
+        result += f"\n*Note: searched {MAX_LIMIT} most recent meetings only.*\n"
+    print(result)
+
+
+def cmd_get(args: list[str]) -> None:
+    """Get a full meeting recording with transcript and summary."""
+    if not args:
+        error("Recording ID required", "Usage: fathom get <recording-id>")
+
+    recording_id = args[0]
+
+    # Fetch lightweight meeting list to find metadata
+    meetings = fetch_meetings({"limit": MAX_LIMIT})
+    meeting = None
+    for m in meetings:
+        if str(m.get("recording_id")) == recording_id:
+            meeting = m
+            break
+
+    if not meeting:
+        error(
+            f"Recording '{recording_id}' not found in recent meetings",
+            "Use 'fathom recent' to see available recording IDs",
+        )
+
+    # Fetch transcript and summary via dedicated endpoints (avoids downloading all transcripts)
+    try:
+        transcript_data = api_get(f"/recordings/{recording_id}/transcript")
+        if isinstance(transcript_data, list):
+            meeting["transcript"] = transcript_data
+        elif isinstance(transcript_data, dict):
+            meeting["transcript"] = (
+                transcript_data.get("transcript")
+                or transcript_data.get("segments")
+                or []
+            )
+    except SystemExit:
+        print("Warning: could not fetch transcript for this recording", file=sys.stderr)
+
+    try:
+        summary_data = api_get(f"/recordings/{recording_id}/summary")
+        if isinstance(summary_data, dict):
+            # Unwrap the {"summary": {...}} envelope — format_transcript expects the inner object
+            meeting["default_summary"] = summary_data.get("summary") or summary_data
+    except SystemExit:
+        print("Warning: could not fetch summary for this recording", file=sys.stderr)
+
+    print(format_transcript(meeting))
+
+
+def cmd_raw(args: list[str]) -> None:
+    """Execute a raw API GET request."""
+    if not args:
+        error(
+            "API path required",
+            'Usage: fathom raw "/meetings" [params-json]',
+        )
+
+    path = args[0]
+    if not path.startswith("/"):
+        path = f"/{path}"
+
+    params = None
+    if len(args) > 1:
+        try:
+            params = json.loads(args[1])
+        except json.JSONDecodeError:
+            error("Invalid JSON for params", f"Got: {args[1]}")
+        if not isinstance(params, dict):
+            error("Params must be a JSON object", f"Got: {type(params).__name__}")
+
+    result = api_get(path, params)
+    print(json.dumps(result, indent=2))
+
+
+def cmd_help() -> None:
+    """Show help message."""
+    print("""Fathom CLI - Query your meeting recordings
+
+Commands:
+  recent [N]           Get N most recent meetings (default: 5, max: 50)
+  today                Get today's meetings
+  date YYYY-MM-DD      Get meetings for a specific date
+  search "query"       Search meetings by title and invitee name
+  get <recording-id>   Get full meeting with transcript by recording ID
+  raw <path> [params]  Raw API GET with optional JSON params
+  help                 Show this help
+
+Environment:
+  FATHOM_API_KEY       Required - your API key
+
+Examples:
+  fathom recent 3
+  fathom today
+  fathom date 2026-01-28
+  fathom search "product roadmap"
+  fathom get 131104306
+  fathom raw "/meetings" '{"limit": 10}'
+
+Get your API key: https://fathom.video → User Settings → API Access""")
+
+
+def main() -> None:
+    """Main entry point."""
+    args = sys.argv[1:]
+    command = args[0] if args else "help"
+
+    commands = {
+        "recent": cmd_recent,
+        "today": cmd_today,
+        "date": cmd_date,
+        "search": cmd_search,
+        "get": cmd_get,
+        "raw": cmd_raw,
+    }
+
+    if command == "help":
+        cmd_help()
+    elif command in commands:
+        commands[command](args[1:])
+    else:
+        error(
+            f"Unknown command: {command}",
+            "Run 'fathom help' for available commands",
+        )
+
+
+if __name__ == "__main__":
+    main()

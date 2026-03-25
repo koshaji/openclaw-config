@@ -394,7 +394,8 @@ def cmd_get(args: list[str]) -> None:
     try:
         summary_data = api_get(f"/recordings/{recording_id}/summary")
         if isinstance(summary_data, dict):
-            meeting["default_summary"] = summary_data
+            # Unwrap the {"summary": {...}} envelope — format_transcript expects the inner object
+            meeting["default_summary"] = summary_data.get("summary") or summary_data
     except SystemExit:
         print("Warning: could not fetch summary for this recording", file=sys.stderr)
 
@@ -419,6 +420,8 @@ def cmd_raw(args: list[str]) -> None:
             params = json.loads(args[1])
         except json.JSONDecodeError:
             error("Invalid JSON for params", f"Got: {args[1]}")
+        if not isinstance(params, dict):
+            error("Params must be a JSON object", f"Got: {type(params).__name__}")
 
     result = api_get(path, params)
     print(json.dumps(result, indent=2))

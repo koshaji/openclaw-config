@@ -214,8 +214,9 @@ As part of each maintenance loop:
 
 ## File Conventions
 
-- All filenames: **kebab-case** (`alex-chen.md`, not `Thomas Owen.md`)
-- People files: `firstname-lastname.md` (or `firstname.md` if unambiguous)
+- All filenames: **kebab-case** (`alex-chen.md`, not `Alex Chen.md`)
+- People files: `firstname-lastname.md` (always include last name when known; never
+  `firstname.md` alone)
 - Date files: `YYYY-MM-DD.md`
 - Decision files: `YYYY-MM-DD-topic.md`
 - All files are markdown

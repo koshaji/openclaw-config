@@ -27,8 +27,15 @@ restic -r "$REPO" forget \
         </string>
     </array>
 
+    <!-- FIXED: Reduced from 14400s (4h) to 7200s (2h) to reduce potential data loss window -->
+    <!-- Source: unisone/openclaw-config production hardening recommendation -->
     <key>StartInterval</key>
-    <integer>14400</integer>
+    <integer>7200</integer>
+
+    <!-- FIXED: ThrottleInterval ensures 5s minimum between restarts (issue #4632) -->
+    <!-- Prevents exponential backoff that causes 5min outages after repeated crashes -->
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
 
     <key>StandardOutPath</key>
     <string>/tmp/openclaw/workspace-backup.log</string>

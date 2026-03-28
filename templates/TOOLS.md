@@ -85,4 +85,58 @@ without losing your notes, and share skills without leaking your infrastructure.
 
 ---
 
+## Security Configuration
+
+### Secrets (.env-only)
+
+⚠️ **NEVER put API keys or secrets in `openclaw.json`.** Use `~/.openclaw/.env` only.
+
+The `${VAR}` syntax in `openclaw.json` resolves to plaintext on `openclaw doctor`
+(issue #9627). All provider keys in `openclaw.json` are sent to the LLM on every turn
+(issue #11202).
+
+**Correct pattern:**
+```bash
+# In ~/.openclaw/.env:
+ANTHROPIC_API_KEY=sk-ant-...
+OPENAI_API_KEY=sk-...
+TELEGRAM_BOT_TOKEN=...
+
+# openclaw.json should NOT contain any of these
+```
+
+**Set permissions:**
+```bash
+chmod 600 ~/.openclaw/.env
+chmod 700 ~/.openclaw/
+```
+
+### Logging
+
+Enable sensitive data redaction to protect tool call content in logs:
+
+```json
+// In ~/.openclaw/openclaw.json:
+{
+  "logging": {
+    "redactSensitive": "tools"
+  }
+}
+```
+
+### Device Inventory (Review Monthly)
+
+Run monthly: `openclaw devices list`
+Remove any device you don't recognize: `openclaw devices remove <id>`
+
+Document known devices here:
+<!-- List your authorized devices below -->
+<!--
+- MacBook Pro (Home) — paired YYYY-MM-DD
+- iPhone 15 — paired YYYY-MM-DD
+- Linux VPS (prod) — paired YYYY-MM-DD
+-->
+
+---
+
 Add whatever helps you do your job. This is your cheat sheet.

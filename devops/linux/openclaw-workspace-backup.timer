@@ -3,7 +3,9 @@ Description=OpenClaw Workspace Backup Timer
 
 [Timer]
 OnBootSec=10min
-OnUnitActiveSec=4h
+# FIXED: Reduced from 4h to 2h to reduce potential data loss window
+# Source: unisone/openclaw-config production hardening recommendation
+OnUnitActiveSec=2h
 AccuracySec=5min
 
 [Install]

@@ -38,11 +38,15 @@ exit $CLAUDE_EXIT
         </string>
     </array>
 
+    <!-- FIXED: Reduced from 1800s (30min) to 300s (5min) for faster crash detection -->
+    <!-- Source: unisone/openclaw-config production hardening research -->
     <key>StartInterval</key>
-    <integer>1800</integer>
-
-    <key>ThrottleInterval</key>
     <integer>300</integer>
+
+    <!-- FIXED: ThrottleInterval ensures 5s minimum between restarts (issue #4632) -->
+    <!-- Prevents exponential backoff that causes 5min outages after repeated crashes -->
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
 
     <key>StandardOutPath</key>
     <string>/tmp/openclaw/health-check-launchd.log</string>

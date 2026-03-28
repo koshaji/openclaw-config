@@ -3,7 +3,9 @@ Description=OpenClaw Health Check Timer
 
 [Timer]
 OnBootSec=5min
-OnUnitActiveSec=30min
+# FIXED: Reduced from 30min to 5min for faster crash detection
+# Source: unisone/openclaw-config production hardening research
+OnUnitActiveSec=5min
 AccuracySec=1min
 
 [Install]

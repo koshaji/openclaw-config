@@ -1,0 +1,67 @@
+[Unit]
+Description=OpenClaw Gateway
+Documentation=https://github.com/koshaji/openclaw-config
+After=network-online.target
+Wants=network-online.target
+
+# The OpenClaw Gateway handles all agent sessions, channel connections,
+# and tool execution. This unit ensures rapid restart on failure and
+# prevents the exponential backoff bug (GitHub issue #4632).
+
+[Service]
+Type=simple
+
+# FIXED: Rapid restart on failure (issue #4632)
+# Without these, systemd's default exponential backoff causes 5min outages
+# after repeated crashes. StartLimitIntervalSec=0 disables the restart
+# rate limiter entirely — the gateway should always come back up.
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=0
+
+# WatchdogSec: if the gateway doesn't respond within 60s, systemd kills
+# and restarts it. This provides PID-level crash detection between health
+# check cycles. Requires the gateway to send systemd watchdog pings.
+WatchdogSec=60
+
+# Gateway process
+ExecStart=/bin/bash -c '\
+  export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"; \
+  CLAUDE_BIN=$(command -v claude || echo "$HOME/.npm-global/bin/claude"); \
+  exec openclaw gateway start'
+
+ExecStop=/bin/bash -c '\
+  export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"; \
+  openclaw gateway stop'
+
+# Logging: errors go to a dedicated log file for easy inspection
+StandardOutput=journal
+StandardError=append:%h/.openclaw/logs/gateway-errors.log
+
+# Resource limits: prevent runaway memory usage
+MemoryMax=2G
+TasksMax=512
+
+# Security hardening
+# NoNewPrivileges prevents privilege escalation
+NoNewPrivileges=true
+# PrivateTmp provides isolated /tmp for the gateway process
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
+
+# Installation instructions:
+#
+#   mkdir -p ~/.config/systemd/user/
+#   cp devops/linux/openclaw-gateway.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now openclaw-gateway.service
+#
+# Verify running:
+#   systemctl --user status openclaw-gateway
+#   openclaw gateway status
+#
+# View logs:
+#   journalctl --user -u openclaw-gateway -f
+#   tail -f ~/.openclaw/logs/gateway-errors.log

@@ -1,0 +1,35 @@
+# OpenClaw Authorized Users
+#
+# This file controls who can send commands to the OpenClaw gateway.
+# One identity per line. Lines starting with # are comments.
+# Blank lines are ignored.
+#
+# FORMAT:
+#   platform:id
+#
+# SUPPORTED PLATFORMS:
+#   telegram:<numeric_user_id>     e.g. telegram:833846354
+#   discord:<user_snowflake_id>    e.g. discord:987654321098765432
+#   slack:<user_id>                e.g. slack:U012AB3CD
+#   whatsapp:<phone_e164>          e.g. whatsapp:+61412345678
+#
+# HOW TO FIND YOUR ID:
+#   Telegram: Send /start to @userinfobot or @myidbot
+#   Discord:  Enable Developer Mode, right-click your name → Copy ID
+#   Slack:    Profile → More → Copy member ID
+#
+# SECURITY NOTES:
+#   - If this file does not exist, ALL users are permitted (backward compatible)
+#   - Create this file to enable the allowlist (opt-in security)
+#   - Keep this file private: chmod 600 ~/.openclaw/authorized-users
+#   - DENY events are logged to ~/.openclaw/audit/auth-denials.jsonl
+#
+# EXAMPLE:
+
+# Primary user (owner)
+# telegram:YOUR_TELEGRAM_ID
+
+# A trusted assistant or admin
+# discord:YOUR_DISCORD_ID
+
+# ── Add your authorized users below this line ────────────────────────────────

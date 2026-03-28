@@ -1,0 +1,223 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""
+audit-export — OpenClaw audit log export and analysis tool
+
+Usage:
+    audit-export [OPTIONS]
+
+Options:
+    --date YYYY-MM-DD   Filter to a specific date
+    --days N            Include the last N days (default: 1)
+    --agent NAME        Filter by agent name
+    --action TYPE       Filter by action type
+    --format FORMAT     Output format: json (default), csv, text
+    --output PATH       Write to file instead of stdout
+    --help              Show this help
+
+Examples:
+    audit-export --days 7
+    audit-export --days 30 --action auth_denied
+    audit-export --agent atlas4 --format text
+    audit-export --days 30 --format csv --output ~/audit.csv
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import gzip
+import json
+import sys
+from datetime import date, datetime, timedelta, timezone
+from io import StringIO
+from pathlib import Path
+
+AUDIT_DIR = Path.home() / ".openclaw" / "audit"
+
+# CSV column order — fixed headers for consistent output
+CSV_COLUMNS = ["ts", "agent", "user", "action", "skill", "args", "session", "result", "reason", "sender", "error", "duration_ms"]
+
+
+def iter_log_file(path: Path):
+    """Yield parsed JSON objects from a .jsonl or .jsonl.gz file."""
+    opener = gzip.open if path.suffix == ".gz" else open
+    try:
+        with opener(path, "rt", encoding="utf-8") as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError as e:
+                    print(f"WARNING: {path}:{line_num}: invalid JSON: {e}", file=sys.stderr)
+    except Exception as e:
+        print(f"WARNING: could not read {path}: {e}", file=sys.stderr)
+
+
+def get_date_paths(audit_dir: Path, dates: list[date]) -> list[Path]:
+    """Return existing audit file paths for the given dates."""
+    paths = []
+    for d in sorted(dates):
+        ds = d.strftime("%Y-%m-%d")
+        # Prefer uncompressed; fall back to compressed
+        plain = audit_dir / f"{ds}.jsonl"
+        compressed = audit_dir / f"{ds}.jsonl.gz"
+        if plain.exists():
+            paths.append(plain)
+        elif compressed.exists():
+            paths.append(compressed)
+    return paths
+
+
+def load_entries(
+    audit_dir: Path,
+    dates: list[date],
+    agent_filter: str | None,
+    action_filter: str | None,
+) -> list[dict]:
+    entries = []
+    for path in get_date_paths(audit_dir, dates):
+        for entry in iter_log_file(path):
+            if agent_filter and entry.get("agent") != agent_filter:
+                continue
+            if action_filter and entry.get("action") != action_filter:
+                continue
+            entries.append(entry)
+    return entries
+
+
+def format_ts(ts: int) -> str:
+    """Format unix timestamp as UTC datetime string."""
+    try:
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(ts)
+
+
+def output_json(entries: list[dict], out) -> None:
+    for entry in entries:
+        out.write(json.dumps(entry) + "\n")
+
+
+def output_csv(entries: list[dict], out) -> None:
+    writer = csv.DictWriter(
+        out,
+        fieldnames=CSV_COLUMNS,
+        extrasaction="ignore",
+        lineterminator="\n",
+    )
+    writer.writeheader()
+    for entry in entries:
+        # Serialize args list as JSON string for CSV
+        row = dict(entry)
+        if "args" in row and isinstance(row["args"], list):
+            row["args"] = json.dumps(row["args"])
+        writer.writerow(row)
+
+
+def output_text(entries: list[dict], out) -> None:
+    for entry in entries:
+        ts = format_ts(entry.get("ts", 0))
+        agent = entry.get("agent", "?")
+        action = entry.get("action", "?")
+
+        parts = [f"{ts} [{agent}] {action}"]
+
+        if skill := entry.get("skill"):
+            parts.append(skill)
+
+        if args := entry.get("args"):
+            parts.append(" ".join(str(a) for a in args))
+
+        details = []
+        if user := entry.get("user"):
+            details.append(f"user: {user}")
+        if sender := entry.get("sender"):
+            details.append(f"sender: {sender}")
+        if session := entry.get("session"):
+            details.append(f"session: {session}")
+        if details:
+            parts.append(f"({', '.join(details)})")
+
+        if result := entry.get("result"):
+            parts.append(f"→ {result}")
+        if reason := entry.get("reason"):
+            parts.append(f"— {reason}")
+        if error := entry.get("error"):
+            parts.append(f"[ERROR: {error}]")
+
+        out.write(" ".join(parts) + "\n")
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Export and filter OpenClaw audit logs",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--date", metavar="YYYY-MM-DD", help="Filter to a specific date")
+    parser.add_argument("--days", type=int, default=1, metavar="N", help="Include last N days (default: 1)")
+    parser.add_argument("--agent", metavar="NAME", help="Filter by agent name")
+    parser.add_argument("--action", metavar="TYPE", help="Filter by action type")
+    parser.add_argument("--format", choices=["json", "csv", "text"], default="json", dest="fmt")
+    parser.add_argument("--output", metavar="PATH", help="Write to file (default: stdout)")
+    return parser.parse_args(argv)
+
+
+def main() -> int:
+    args = parse_args(sys.argv[1:])
+
+    # Resolve date range
+    today = date.today()
+    if args.date:
+        try:
+            target = date.fromisoformat(args.date)
+            dates = [target]
+        except ValueError:
+            print(f"ERROR: invalid date format '{args.date}'. Use YYYY-MM-DD.", file=sys.stderr)
+            return 2
+    else:
+        dates = [today - timedelta(days=i) for i in range(args.days - 1, -1, -1)]
+
+    if not AUDIT_DIR.exists():
+        print(f"Audit directory not found: {AUDIT_DIR}", file=sys.stderr)
+        return 0
+
+    entries = load_entries(AUDIT_DIR, dates, args.agent, args.action)
+
+    # Sort by timestamp
+    entries.sort(key=lambda e: e.get("ts", 0))
+
+    # Determine output destination
+    if args.output:
+        out_path = Path(args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_file = out_path.open("w", encoding="utf-8")
+        close_file = True
+    else:
+        out_file = sys.stdout
+        close_file = False
+
+    try:
+        if args.fmt == "json":
+            output_json(entries, out_file)
+        elif args.fmt == "csv":
+            output_csv(entries, out_file)
+        elif args.fmt == "text":
+            output_text(entries, out_file)
+    finally:
+        if close_file:
+            out_file.close()
+
+    if args.output:
+        print(f"Exported {len(entries)} entries to {args.output}", file=sys.stderr)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -21,6 +21,17 @@ below are relative to TechNickAI/openclaw-config v0.17.0.
 
 ### Added
 
+**Phase 4 Integration — Swarm Orchestration**
+- Added Ruflo ([ruvnet/ruflo](https://github.com/ruvnet/ruflo)) as recommended swarm
+  orchestration integration for Phase 4: NL fleet control + agent swarm coordination
+- Updated `GAP_CLOSING_PLAN.md` Gap 4 with Ruflo as Option C alongside MCP and
+  `unisone` smart-routing pattern; Proposed Solution updated to evaluate Ruflo before
+  building custom fleet-commander
+- Added `GAP_ANALYSIS_SUMMARY.md` — concise gap reference with all options per gap,
+  including Ruflo under Gap 4
+- Updated Phase 4 roadmap: "Evaluate Ruflo swarm integration" as first task
+- Updated Section 7 Open-Source Tool Reference Card with Ruflo (MIT, Medium complexity)
+
 **Fork Identity**
 - `README.md` — Rewritten with fork identity, comparison table, security quick-start,
   credits to upstream and community repos (unisone, digitalknk)

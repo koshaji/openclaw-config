@@ -445,30 +445,62 @@ The learning loop builds a `patterns.json` that improves routing over time.
 **Fit:** Directly applicable to fleet management. Adopt this pattern for
 `workflows/fleet-commander/`.
 
+**Option C: Ruflo** ([github.com/ruvnet/ruflo](https://github.com/ruvnet/ruflo))
+
+Open-source swarm orchestration platform purpose-built for Claude (v3.5+, MIT license).
+Supports hierarchical (queen/worker) and mesh (peer-to-peer) swarm patterns out of the
+box. Ships with 100+ pre-built agents, is MCP-native, and supports multi-LLM routing
+(Claude / GPT / Gemini with smart model selection).
+
+**Key capabilities:**
+- Self-optimizing routing (SONA) — learns which agent/model handles each task best
+- Fault-tolerant consensus with auto-respawn (similar to `unisone`'s health loop, but
+  built-in rather than scripted)
+- HNSW vector search and RAG built-in — no separate embedding service required
+- 324MB Docker image (`npx ruflo` also works for local use)
+- MCP-native — exposes swarm operations as MCP tools, directly consumable by Claude
+
+**Fit: HIGH** — Ruflo directly solves both the NL fleet control problem *and* the
+broader swarm orchestration challenge. It could replace the custom `fleet-commander`
+workflow entirely, providing a production-ready swarm layer instead of a hand-rolled
+script-based orchestrator. Recommended evaluation path: use Ruflo's swarm patterns for
+agent coordination, MCP for the tool interface.
+
 #### Proposed Solution
 
-1. **`workflows/fleet-commander/AGENT.md`** — New workflow implementing the
-   `unisone/openclaw-config` smart-routing pattern for fleet operations. Accepts NL
-   commands, routes to the appropriate fleet operation, maintains a learning log of
-   what operations were most effective.
+**Evaluate Ruflo before building custom.** Ruflo's swarm orchestration capabilities
+(SONA routing, auto-respawn, MCP-native tooling) may replace the need for a custom
+`fleet-commander` workflow entirely. Pilot Ruflo first; fall back to the custom MCP
+approach if Ruflo's operational overhead outweighs its benefits for the deployment scale.
 
-2. **`skills/fleet-mcp-server/`** — New UV script that runs a lightweight MCP server
-   exposing fleet operations as typed tools:
+1. **`docs/RUFLO_SETUP.md`** — New: evaluation guide for deploying Ruflo as the swarm
+   orchestration layer. Covers Docker / npx setup, configuring queen/worker topology for
+   the openclaw-config fleet, connecting Ruflo's MCP interface to Claude sessions, and
+   mapping existing fleet operations to Ruflo agents.
+
+2. **`workflows/fleet-commander/AGENT.md`** — New workflow implementing the
+   `unisone/openclaw-config` smart-routing pattern for fleet operations (fallback if
+   Ruflo evaluation does not pan out). Accepts NL commands, routes to the appropriate
+   fleet operation, maintains a learning log of what operations were most effective.
+
+3. **`skills/fleet-mcp-server/`** — New UV script that runs a lightweight MCP server
+   exposing fleet operations as typed tools (used alongside or instead of Ruflo):
    - `fleet_health_check(machines: list[str])` → health status
    - `fleet_update(machines: list[str], component: str)` → deploy update
    - `fleet_restart(machines: list[str], graceful: bool)` → restart gateways
    - `fleet_status()` → full fleet inventory
 
-3. **Update `.claude/commands/fleet.md`** — Add NL entry point: when invoked without
+4. **Update `.claude/commands/fleet.md`** — Add NL entry point: when invoked without
    structured arguments, route to `fleet-commander` workflow. Reference the MCP server
    for programmatic invocation.
 
-4. **`docs/MCP_FLEET_SETUP.md`** — Guide for connecting the fleet MCP server to a
+5. **`docs/MCP_FLEET_SETUP.md`** — Guide for connecting the fleet MCP server to a
    Claude session. References the MCP protocol spec and explains how to register the
    server.
 
-**What we're standing on:** MCP (open protocol) for the tool interface,
-`unisone/openclaw-config`'s smart routing pattern for the NL→operation translation.
+**What we're standing on:** Ruflo (swarm orchestration + MCP-native tooling) as the
+recommended first-pass; MCP (open protocol) + `unisone/openclaw-config`'s smart routing
+pattern as the fallback for teams that prefer a lighter-weight custom solution.
 
 ---
 
@@ -910,6 +942,7 @@ built-in restart behavior with `ThrottleInterval`.
 
 | Task | Open-Source Tool | Files | Effort |
 |------|-----------------|-------|--------|
+| Evaluate Ruflo swarm integration | Ruflo ([ruvnet/ruflo](https://github.com/ruvnet/ruflo)) | `docs/RUFLO_SETUP.md`, `workflows/fleet-commander/` | M |
 | Fleet MCP server | [MCP protocol](https://modelcontextprotocol.io) | `skills/fleet-mcp-server/` | M |
 | NL fleet commander workflow | `unisone` smart routing pattern | `workflows/fleet-commander/AGENT.md` | M |
 | NL entry point in `/fleet` command | Custom | `.claude/commands/fleet.md` | S |
@@ -1123,6 +1156,7 @@ Quick reference for all recommended integrations:
 | Policy engine (enterprise) | OPA | Apache 2.0 | [github.com/open-policy-agent/opa](https://github.com/open-policy-agent/opa) | High (service) |
 | SSO (teams) | Authentik | MIT | [github.com/goauthentik/authentik](https://github.com/goauthentik/authentik) | Medium (Docker) |
 | SSO (individuals) | Authelia | Apache 2.0 | [github.com/authelia/authelia](https://github.com/authelia/authelia) | Low (binary) |
+| Swarm orchestration | Ruflo | MIT | [github.com/ruvnet/ruflo](https://github.com/ruvnet/ruflo) | Medium (Docker/npx) |
 | NL fleet control | MCP protocol | MIT | [modelcontextprotocol.io](https://modelcontextprotocol.io) | Low (UV script) |
 | Self-healing (Linux) | systemd watchdog | GPL | Built-in Linux | None (native) |
 | Self-healing (macOS) | launchd ThrottleInterval | proprietary | Built-in macOS | None (native) |

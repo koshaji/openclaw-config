@@ -1,0 +1,250 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""
+user-router — OpenClaw multi-user context router
+
+Usage:
+    user-router <identity>
+
+Arguments:
+    identity    Sender identity in format platform:id
+                Examples: telegram:833846354, discord:987654321, whatsapp:+61400000000
+
+Output:
+    JSON object with user context:
+    {
+      "identity": "telegram:833846354",
+      "name": "Hani",
+      "role": "owner",
+      "timezone": "Australia/Melbourne",
+      "language": "en",
+      "memory_path": "/home/user/.openclaw/workspace/memory/users/hani",
+      "preferences": {
+        "style": "concise",
+        "format": "markdown"
+      },
+      "profile_file": "/home/user/.openclaw/workspace/USERS/telegram-833846354.md",
+      "found": true
+    }
+
+    If no profile found, returns a guest profile with Observer role.
+
+Exit codes:
+    0    Success (profile found or guest returned)
+    2    Usage error
+
+Profile search locations:
+    ~/.openclaw/workspace/USERS/
+    ~/.openclaw/workspace/  (USERS subdirectory)
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+from pathlib import Path
+
+# ── Paths ──────────────────────────────────────────────────────────────────
+OPENCLAW_DIR = Path.home() / ".openclaw"
+WORKSPACE_DIR = OPENCLAW_DIR / "workspace"
+USERS_DIR = WORKSPACE_DIR / "USERS"
+MEMORY_USERS_DIR = WORKSPACE_DIR / "memory" / "users"
+
+# ── Guest profile defaults ─────────────────────────────────────────────────
+GUEST_PROFILE = {
+    "name": "Guest",
+    "role": "observer",
+    "timezone": "UTC",
+    "language": "en",
+    "preferences": {},
+    "memory_path": None,
+    "profile_file": None,
+    "found": False,
+}
+
+
+def identity_to_filename(identity: str) -> str:
+    """Convert platform:id to filename stem, e.g. telegram:833846354 → telegram-833846354"""
+    return identity.replace(":", "-")
+
+
+def parse_profile(path: Path) -> dict:
+    """
+    Parse a Markdown user profile file.
+    Extracts key fields from structured sections.
+    Returns a dict with user context fields.
+    """
+    text = path.read_text(encoding="utf-8")
+    profile: dict = {}
+
+    # Extract name — first H1 heading or "Name:" field
+    if m := re.search(r"^#\s+(.+)", text, re.MULTILINE):
+        raw_name = m.group(1).strip()
+        # Strip "USER Profile —" or similar prefixes
+        raw_name = re.sub(r"^USER\s+Profile\s*[—-]\s*", "", raw_name, flags=re.IGNORECASE)
+        if raw_name and not raw_name.startswith("["):
+            profile["name"] = raw_name
+
+    # Extract fields from "- **Key:** Value" format
+    field_pattern = re.compile(r"^\s*[-*]\s+\*\*([^*]+)\*\*[:\s]+(.+)", re.MULTILINE)
+    for m in field_pattern.finditer(text):
+        key = m.group(1).strip().lower()
+        value = m.group(2).strip()
+        if value.startswith("[") and value.endswith("]"):
+            continue  # skip unfilled template placeholders
+        if key == "name":
+            profile["name"] = value
+        elif key == "role":
+            profile["role"] = value
+        elif key in ("timezone", "tz"):
+            profile["timezone"] = value
+        elif key == "language":
+            profile["language"] = value
+        elif key == "memory path":
+            profile["memory_path"] = value
+        elif key == "communication style":
+            profile.setdefault("preferences", {})["style"] = value
+        elif key == "format":
+            profile.setdefault("preferences", {})["format"] = value
+
+    # Extract identities block — look for lines like: - telegram:833846354
+    identities: list[str] = []
+    ident_section = re.search(
+        r"##\s+Identities?\s*\n(.*?)(?=\n##|\Z)", text, re.DOTALL | re.IGNORECASE
+    )
+    if ident_section:
+        for line in ident_section.group(1).splitlines():
+            line = line.strip().lstrip("-* ")
+            if re.match(r"^\w+:\S+", line) and not line.startswith("["):
+                identities.append(line)
+    profile["identities"] = identities
+
+    # Extract preferences block
+    prefs_section = re.search(
+        r"##\s+Preferences?\s*\n(.*?)(?=\n##|\Z)", text, re.DOTALL | re.IGNORECASE
+    )
+    if prefs_section:
+        pref_text = prefs_section.group(1)
+        for m in field_pattern.finditer(pref_text):
+            key = m.group(1).strip().lower().replace(" ", "_")
+            value = m.group(2).strip()
+            if not (value.startswith("[") and value.endswith("]")):
+                profile.setdefault("preferences", {})[key] = value
+
+    return profile
+
+
+def find_user_profile(identity: str) -> tuple[Path | None, dict]:
+    """
+    Search USERS_DIR for a profile matching `identity`.
+
+    Search order:
+    1. <platform>-<id>.md  (e.g., telegram-833846354.md)
+    2. Any .md file containing the identity string in an Identities section
+    3. Any .md file with the identity anywhere in the file (loose match)
+
+    Returns (profile_path, parsed_profile_dict) or (None, {}) if not found.
+    """
+    if not USERS_DIR.exists():
+        return None, {}
+
+    # 1. Direct filename match
+    filename = identity_to_filename(identity) + ".md"
+    direct = USERS_DIR / filename
+    if direct.exists():
+        profile = parse_profile(direct)
+        return direct, profile
+
+    # 2. Search all .md files for identity mention
+    for profile_path in sorted(USERS_DIR.glob("*.md")):
+        try:
+            text = profile_path.read_text(encoding="utf-8")
+            if identity in text:
+                profile = parse_profile(profile_path)
+                return profile_path, profile
+        except Exception:
+            continue
+
+    return None, {}
+
+
+def resolve_memory_path(identity: str, profile: dict) -> str | None:
+    """
+    Resolve the per-user memory path.
+    Uses explicit memory_path from profile if set, otherwise derives from name/identity.
+    """
+    # Use explicit path from profile
+    if explicit := profile.get("memory_path"):
+        expanded = explicit.replace("~", str(Path.home()))
+        return expanded
+
+    # Derive from name (slugified) or identity
+    name = profile.get("name", "")
+    if name and name.lower() not in ("guest", "[full name or handle]"):
+        slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    else:
+        # Derive from identity: telegram:833846354 → telegram-833846354
+        slug = identity_to_filename(identity)
+
+    return str(MEMORY_USERS_DIR / slug)
+
+
+def build_context(identity: str, profile_path: Path | None, raw_profile: dict) -> dict:
+    """Assemble the final user context dict."""
+    if not raw_profile:
+        ctx = dict(GUEST_PROFILE)
+        ctx["identity"] = identity
+        return ctx
+
+    memory_path = resolve_memory_path(identity, raw_profile)
+
+    ctx: dict = {
+        "identity": identity,
+        "name": raw_profile.get("name", "Unknown"),
+        "role": raw_profile.get("role", "observer"),
+        "timezone": raw_profile.get("timezone", "UTC"),
+        "language": raw_profile.get("language", "en"),
+        "memory_path": memory_path,
+        "preferences": raw_profile.get("preferences", {}),
+        "profile_file": str(profile_path) if profile_path else None,
+        "found": True,
+    }
+
+    # Include additional identities if present
+    if identities := raw_profile.get("identities"):
+        ctx["identities"] = identities
+
+    return ctx
+
+
+def main() -> int:
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+
+    identity = sys.argv[1].strip()
+
+    if not identity:
+        print("ERROR: identity cannot be empty", file=sys.stderr)
+        return 2
+
+    # Validate format loosely
+    if ":" not in identity:
+        print(
+            f"WARNING: identity '{identity}' doesn't look like platform:id format",
+            file=sys.stderr,
+        )
+
+    profile_path, raw_profile = find_user_profile(identity)
+    ctx = build_context(identity, profile_path, raw_profile)
+
+    print(json.dumps(ctx, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,9 +1,9 @@
 ---
 description:
   "Manage OpenClaw installations across multiple servers - assess state, push updates,
-  notify users"
-argument-hint: "[server-name]"
-version: 0.1.0
+  notify users. Supports natural language commands and --no-ssh MCP mode."
+argument-hint: "[server-name | --no-ssh | NL command]"
+version: 0.2.0
 ---
 
 # Fleet Management 🚀
@@ -136,3 +136,76 @@ What needs attention
 ```
 
 </fleet-file-format>
+
+## Natural Language Mode
+
+When invoked with a natural language command (no structured flags), the fleet command
+routes to the **fleet-commander workflow** for intent classification and execution.
+
+```
+/fleet check if all agents are healthy
+/fleet restart the gateway on mac-mini-01
+/fleet what happened on mac-mini-01 last night?
+/fleet show me the fleet status
+/fleet push config to all machines
+```
+
+The fleet commander:
+1. Classifies your intent using `workflows/fleet-commander/routing-rules.md`
+2. Extracts machine names and parameters from your message
+3. Calls the appropriate `fleet_*` tool via `skills/fleet-mcp-server/`
+4. Returns a natural language summary of results
+
+**Confirmation policy:** Read operations (health check, status, logs) run immediately.
+Write operations (restart, update, config push) ask for confirmation before executing,
+unless you name specific machines explicitly and use confident language.
+
+**Learning:** Every command is logged to `~/.openclaw/fleet/routing-patterns.json`.
+After ≥3 similar commands, the commander learns your preferences and stops asking for
+confirmation on familiar operations.
+
+---
+
+## --no-ssh Mode
+
+Pass `--no-ssh` to route fleet operations through the MCP server instead of direct SSH.
+This is the recommended mode for machines where SSH is not available or not desired.
+
+```bash
+# Check health without SSH
+/fleet --no-ssh check health
+
+# Restart via MCP server
+/fleet --no-ssh restart mac-mini-01
+
+# Push config via MCP server
+/fleet --no-ssh push config to mac-mini-01
+
+# Start the MCP server in SSE mode (for persistent use)
+./skills/fleet-mcp-server/fleet-mcp-server --transport sse --port 8766
+```
+
+**When to use `--no-ssh`:**
+
+| Scenario | Recommendation |
+|----------|---------------|
+| SSH enabled on all machines | Default SSH mode (faster, simpler) |
+| Machines behind NAT / firewall | `--no-ssh` via fleet-agent |
+| Scripted/automated operations | `--no-ssh` via MCP server |
+| NL commands from Atlas4 | Always uses `--no-ssh` / MCP server |
+| Tailscale available | Either mode works; `--no-ssh` preferred |
+
+**How `--no-ssh` works:**
+
+The `--no-ssh` flag routes commands through the fleet-agent inbox/outbox pattern:
+1. Command is HMAC-signed and written to `~/.openclaw/fleet-inbox/cmd-<uuid>.json`
+2. `fleet-agent` on the target machine picks it up (polls every 30s)
+3. Result is written to `~/.openclaw/fleet-outbox/result-<uuid>.json`
+4. The fleet command reads the result and returns it
+
+Prerequisites for `--no-ssh` mode:
+- `fleet-agent` must be running on each target machine (`skills/fleet-agent/fleet-agent daemon`)
+- Shared HMAC key must be configured (`~/.openclaw/fleet/fleet-hmac-key`)
+- Fleet inventory must be populated (`~/.openclaw/fleet/inventory.json`)
+
+See `skills/fleet-mcp-server/SKILL.md` for full setup instructions.

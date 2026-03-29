@@ -1,0 +1,634 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "mcp>=1.0.0",
+#   "anyio>=4.0.0",
+# ]
+# ///
+"""
+fleet-mcp-server — MCP server exposing fleet operations as typed tools
+
+Exposes 6 tools to MCP clients (Claude Desktop, OpenClaw, etc.):
+  fleet_status         — list all machines with health
+  fleet_health_check   — run health check on machines
+  fleet_restart        — restart gateway on machines
+  fleet_update         — update component on machines
+  fleet_config_push    — push config to machines
+  fleet_logs           — get recent logs from a machine
+
+Communication with remote machines uses the fleet-agent inbox/outbox pattern.
+Commands are HMAC-SHA256 signed before writing to the inbox.
+
+Usage:
+  ./fleet-mcp-server                          # stdio mode (MCP client)
+  ./fleet-mcp-server --transport sse          # SSE mode
+  ./fleet-mcp-server --transport sse --port 8766
+"""
+
+import argparse
+import asyncio
+import hashlib
+import hmac
+import json
+import logging
+import os
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import mcp.server.stdio
+import mcp.types as types
+from mcp.server import NotificationOptions, Server
+from mcp.server.models import InitializationOptions
+
+# ---------------------------------------------------------------------------
+# Configuration paths
+# ---------------------------------------------------------------------------
+
+HOME = Path.home()
+FLEET_DIR = HOME / ".openclaw" / "fleet"
+INVENTORY_FILE = FLEET_DIR / "inventory.json"
+HMAC_KEY_FILE = FLEET_DIR / "fleet-hmac-key"
+RBAC_FILE = FLEET_DIR / "rbac.json"
+AUDIT_LOG = HOME / ".openclaw" / "audit" / "fleet-mcp-server.jsonl"
+FLEET_INBOX = HOME / ".openclaw" / "fleet-inbox"
+FLEET_OUTBOX = HOME / ".openclaw" / "fleet-outbox"
+
+# Command result poll config
+POLL_INTERVAL_S = 1.0
+POLL_TIMEOUT_S = 30.0
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [fleet-mcp-server] %(levelname)s %(message)s",
+    handlers=[logging.StreamHandler(sys.stderr)],
+)
+log = logging.getLogger("fleet-mcp-server")
+
+
+# ---------------------------------------------------------------------------
+# Inventory
+# ---------------------------------------------------------------------------
+
+def load_inventory() -> dict:
+    """Load fleet inventory from ~/.openclaw/fleet/inventory.json."""
+    if not INVENTORY_FILE.exists():
+        return {"machines": [], "updated_at": None}
+    with INVENTORY_FILE.open() as f:
+        return json.load(f)
+
+
+def get_machine(name: str) -> dict | None:
+    inv = load_inventory()
+    for m in inv.get("machines", []):
+        if m["name"] == name:
+            return m
+    return None
+
+
+def all_machine_names() -> list[str]:
+    return [m["name"] for m in load_inventory().get("machines", [])]
+
+
+# ---------------------------------------------------------------------------
+# RBAC
+# ---------------------------------------------------------------------------
+
+def load_rbac() -> dict:
+    """Load RBAC config. Returns permissive defaults if file missing."""
+    if not RBAC_FILE.exists():
+        return {
+            "roles": {},
+            "operations": {
+                "read": ["fleet_status", "fleet_health_check", "fleet_logs"],
+                "write": ["fleet_restart", "fleet_update"],
+                "admin": ["fleet_config_push"],
+            },
+        }
+    with RBAC_FILE.open() as f:
+        return json.load(f)
+
+
+def check_rbac(agent_id: str, tool_name: str) -> bool:
+    """Return True if agent_id is allowed to call tool_name."""
+    rbac = load_rbac()
+    agent_roles = rbac.get("roles", {}).get(agent_id, ["read"])  # default read-only
+    ops_map = rbac.get("operations", {})
+    for role in agent_roles:
+        if tool_name in ops_map.get(role, []):
+            return True
+    return False
+
+
+def get_agent_id() -> str:
+    return (
+        os.environ.get("OPENCLAW_AGENT_ID")
+        or os.environ.get("X_AGENT_IDENTITY")
+        or "unknown"
+    )
+
+
+# ---------------------------------------------------------------------------
+# HMAC signing
+# ---------------------------------------------------------------------------
+
+def load_hmac_key() -> bytes | None:
+    if not HMAC_KEY_FILE.exists():
+        return None
+    return HMAC_KEY_FILE.read_bytes().strip()
+
+
+def sign_command(cmd: dict, key: bytes) -> str:
+    """Return HMAC-SHA256 hex digest for command dict (excluding 'hmac' key)."""
+    payload = json.dumps({k: v for k, v in sorted(cmd.items()) if k != "hmac"}, separators=(",", ":"))
+    return hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Inbox/outbox communication
+# ---------------------------------------------------------------------------
+
+def write_command(operation: str, args: dict, inbox_path: Path) -> str:
+    """Write a signed command to the fleet inbox. Returns command_id."""
+    inbox_path.mkdir(parents=True, exist_ok=True)
+    cmd_id = str(uuid.uuid4())[:8]
+    cmd = {
+        "id": cmd_id,
+        "ts": int(time.time()),
+        "nonce": uuid.uuid4().hex,
+        "operation": operation,
+        "args": args,
+    }
+    key = load_hmac_key()
+    if key:
+        cmd["hmac"] = sign_command(cmd, key)
+    else:
+        cmd["hmac"] = "unsigned"
+        log.warning("HMAC key not found — command will be unsigned")
+    cmd_file = inbox_path / f"cmd-{cmd_id}.json"
+    cmd_file.write_text(json.dumps(cmd, indent=2))
+    log.info(f"Wrote command {cmd_id} ({operation}) to {cmd_file}")
+    return cmd_id
+
+
+async def poll_result(cmd_id: str, outbox_path: Path) -> dict | None:
+    """Poll outbox for a result. Returns None on timeout."""
+    result_file = outbox_path / f"result-{cmd_id}.json"
+    deadline = time.time() + POLL_TIMEOUT_S
+    while time.time() < deadline:
+        if result_file.exists():
+            try:
+                return json.loads(result_file.read_text())
+            except json.JSONDecodeError:
+                pass
+        await asyncio.sleep(POLL_INTERVAL_S)
+    return None
+
+
+def get_machine_inbox(machine: dict) -> Path:
+    """Return the inbox path for a machine (local or configured path)."""
+    return Path(machine.get("inbox", str(FLEET_INBOX)))
+
+
+def get_machine_outbox(machine: dict) -> Path:
+    return Path(machine.get("outbox", str(FLEET_OUTBOX)))
+
+
+# ---------------------------------------------------------------------------
+# Audit log
+# ---------------------------------------------------------------------------
+
+def audit(tool: str, machines: list[str], args: dict, result: str, cmd_ids: list[str]):
+    AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "agent": get_agent_id(),
+        "tool": tool,
+        "machines": machines,
+        "args": args,
+        "result": result,
+        "command_ids": cmd_ids,
+    }
+    with AUDIT_LOG.open("a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Helper: run operation on a set of machines
+# ---------------------------------------------------------------------------
+
+async def run_on_machines(
+    operation: str,
+    args: dict,
+    machine_names: list[str] | None,
+) -> dict:
+    """Send operation to each machine, collect results. Returns per-machine dict."""
+    targets = machine_names or all_machine_names()
+    if not targets:
+        return {"error": "No machines in fleet inventory. Check ~/.openclaw/fleet/inventory.json"}
+
+    results = {}
+    cmd_ids = []
+    for name in targets:
+        machine = get_machine(name)
+        if not machine:
+            results[name] = {"status": "error", "error": f"Machine '{name}' not in inventory"}
+            continue
+        inbox = get_machine_inbox(machine)
+        cmd_id = write_command(operation, args, inbox)
+        cmd_ids.append(cmd_id)
+        results[name] = {"status": "pending", "command_id": cmd_id}
+
+    # Poll for results
+    for name, r in results.items():
+        if r.get("status") != "pending":
+            continue
+        machine = get_machine(name)
+        outbox = get_machine_outbox(machine)
+        result = await poll_result(r["command_id"], outbox)
+        if result is None:
+            results[name] = {
+                "status": "timeout",
+                "command_id": r["command_id"],
+                "error": f"No response from fleet-agent on '{name}' within {POLL_TIMEOUT_S}s",
+            }
+        else:
+            results[name] = result
+
+    return {"machines": results, "command_ids": cmd_ids}
+
+
+# ---------------------------------------------------------------------------
+# MCP Server
+# ---------------------------------------------------------------------------
+
+server = Server("fleet-mcp-server")
+
+
+@server.list_tools()
+async def handle_list_tools() -> list[types.Tool]:
+    return [
+        types.Tool(
+            name="fleet_status",
+            description="Get status of all fleet machines (reads from inventory, returns machine list with connection health)",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        ),
+        types.Tool(
+            name="fleet_health_check",
+            description="Run health check on specified machines (or all if none specified). Checks gateway health, session counts, and system resources.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "machines": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Machine names to check. Omit for all machines.",
+                    }
+                },
+                "required": [],
+            },
+        ),
+        types.Tool(
+            name="fleet_restart",
+            description="Restart the OpenClaw gateway on specified machines. Uses graceful restart by default (waits for active sessions to complete).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "machines": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Machine names to restart.",
+                    },
+                    "graceful": {
+                        "type": "boolean",
+                        "description": "Wait for active sessions before restarting (default: true). Set false for force restart.",
+                        "default": True,
+                    },
+                },
+                "required": ["machines"],
+            },
+        ),
+        types.Tool(
+            name="fleet_update",
+            description="Update a component on specified machines.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "machines": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Machine names to update.",
+                    },
+                    "component": {
+                        "type": "string",
+                        "description": "Component to update: 'gateway' (default), 'skills', 'config', or 'all'.",
+                        "enum": ["gateway", "skills", "config", "all"],
+                        "default": "gateway",
+                    },
+                },
+                "required": ["machines"],
+            },
+        ),
+        types.Tool(
+            name="fleet_config_push",
+            description="Push a configuration file to specified machines. Validates config before pushing.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "machines": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Machine names to push config to.",
+                    },
+                    "config_path": {
+                        "type": "string",
+                        "description": "Path to the config file to push (on the commander machine).",
+                    },
+                },
+                "required": ["machines", "config_path"],
+            },
+        ),
+        types.Tool(
+            name="fleet_logs",
+            description="Get recent gateway logs from a specific machine.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "machine": {
+                        "type": "string",
+                        "description": "Machine name to get logs from.",
+                    },
+                    "lines": {
+                        "type": "integer",
+                        "description": "Number of log lines to return (default: 50, max: 500).",
+                        "default": 50,
+                        "minimum": 1,
+                        "maximum": 500,
+                    },
+                },
+                "required": ["machine"],
+            },
+        ),
+    ]
+
+
+@server.call_tool()
+async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+    agent_id = get_agent_id()
+
+    # RBAC check for write operations
+    write_ops = {"fleet_restart", "fleet_update", "fleet_config_push"}
+    if name in write_ops and not check_rbac(agent_id, name):
+        msg = f"RBAC denied: agent '{agent_id}' is not permitted to call '{name}'"
+        log.warning(msg)
+        audit(name, [], arguments, "rbac_denied", [])
+        return [types.TextContent(type="text", text=json.dumps({"error": msg}))]
+
+    try:
+        result = await dispatch_tool(name, arguments)
+        audit(
+            name,
+            arguments.get("machines", [arguments.get("machine", "all")]),
+            arguments,
+            "ok",
+            result.get("command_ids", []) if isinstance(result, dict) else [],
+        )
+        return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+    except Exception as e:
+        log.exception(f"Error calling tool '{name}'")
+        audit(name, [], arguments, f"error: {e}", [])
+        return [types.TextContent(type="text", text=json.dumps({"error": str(e)}))]
+
+
+async def dispatch_tool(name: str, arguments: dict) -> dict | str:
+    """Route tool calls to implementations."""
+
+    if name == "fleet_status":
+        return await tool_fleet_status()
+
+    elif name == "fleet_health_check":
+        machines = arguments.get("machines") or None
+        return await tool_fleet_health_check(machines)
+
+    elif name == "fleet_restart":
+        machines = arguments["machines"]
+        graceful = arguments.get("graceful", True)
+        return await tool_fleet_restart(machines, graceful)
+
+    elif name == "fleet_update":
+        machines = arguments["machines"]
+        component = arguments.get("component", "gateway")
+        return await tool_fleet_update(machines, component)
+
+    elif name == "fleet_config_push":
+        machines = arguments["machines"]
+        config_path = arguments["config_path"]
+        return await tool_fleet_config_push(machines, config_path)
+
+    elif name == "fleet_logs":
+        machine = arguments["machine"]
+        lines = min(int(arguments.get("lines", 50)), 500)
+        return await tool_fleet_logs(machine, lines)
+
+    else:
+        return {"error": f"Unknown tool: {name}"}
+
+
+# ---------------------------------------------------------------------------
+# Tool implementations
+# ---------------------------------------------------------------------------
+
+async def tool_fleet_status() -> dict:
+    """List all machines with their basic status from inventory."""
+    inv = load_inventory()
+    machines = []
+    for m in inv.get("machines", []):
+        inbox = get_machine_inbox(m)
+        outbox = get_machine_outbox(m)
+        machines.append({
+            "name": m["name"],
+            "host": m.get("host", "unknown"),
+            "role": m.get("role", "worker"),
+            "agents": m.get("agents", []),
+            "inbox_exists": inbox.exists(),
+            "outbox_exists": outbox.exists(),
+        })
+    return {
+        "machines": machines,
+        "total": len(machines),
+        "inventory_updated_at": inv.get("updated_at"),
+    }
+
+
+async def tool_fleet_health_check(machines: list[str] | None) -> dict:
+    """Send health_check command to machines and collect results."""
+    return await run_on_machines("gateway_status", {}, machines)
+
+
+async def tool_fleet_restart(machines: list[str], graceful: bool) -> dict:
+    """Send restart command to specified machines."""
+    operation = "gateway_restart"
+    args = {"graceful": graceful, "force": not graceful}
+    return await run_on_machines(operation, args, machines)
+
+
+async def tool_fleet_update(machines: list[str], component: str) -> dict:
+    """Send update command to specified machines."""
+    return await run_on_machines("update", {"component": component}, machines)
+
+
+async def tool_fleet_config_push(machines: list[str], config_path: str) -> dict:
+    """Validate and push config file to machines."""
+    path = Path(config_path)
+    if not path.exists():
+        return {"error": f"Config file not found: {config_path}"}
+
+    # Basic validation: must be readable and non-empty
+    try:
+        content = path.read_text()
+        if not content.strip():
+            return {"error": f"Config file is empty: {config_path}"}
+        # Try JSON parse if .json extension
+        if path.suffix == ".json":
+            json.loads(content)
+    except Exception as e:
+        return {"error": f"Config validation failed: {e}"}
+
+    args = {"config_path": str(path.resolve()), "config_content": content}
+    return await run_on_machines("config_push", args, machines)
+
+
+async def tool_fleet_logs(machine: str, lines: int) -> dict:
+    """Request log export from a machine's fleet agent."""
+    m = get_machine(machine)
+    if not m:
+        return {"error": f"Machine '{machine}' not found in inventory"}
+
+    inbox = get_machine_inbox(m)
+    outbox = get_machine_outbox(m)
+    cmd_id = write_command("log_export", {"lines": lines}, inbox)
+
+    result = await poll_result(cmd_id, outbox)
+    if result is None:
+        return {
+            "machine": machine,
+            "command_id": cmd_id,
+            "error": f"No response from fleet-agent on '{machine}' within {POLL_TIMEOUT_S}s",
+        }
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+async def run_stdio():
+    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
+        await server.run(
+            read_stream,
+            write_stream,
+            InitializationOptions(
+                server_name="fleet-mcp-server",
+                server_version="1.0.0",
+                capabilities=server.get_capabilities(
+                    notification_options=NotificationOptions(),
+                    experimental_capabilities={},
+                ),
+            ),
+        )
+
+
+async def run_sse(port: int):
+    """Run in SSE mode for HTTP clients."""
+    try:
+        from mcp.server.sse import SseServerTransport
+        from starlette.applications import Starlette
+        from starlette.routing import Route, Mount
+        import uvicorn
+    except ImportError:
+        log.error("SSE mode requires: pip install starlette uvicorn")
+        sys.exit(1)
+
+    sse = SseServerTransport("/messages")
+
+    async def handle_sse(request):
+        async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
+            await server.run(
+                streams[0],
+                streams[1],
+                InitializationOptions(
+                    server_name="fleet-mcp-server",
+                    server_version="1.0.0",
+                    capabilities=server.get_capabilities(
+                        notification_options=NotificationOptions(),
+                        experimental_capabilities={},
+                    ),
+                ),
+            )
+
+    async def handle_messages(request):
+        await sse.handle_post_message(request.scope, request.receive, request._send)
+
+    app = Starlette(
+        routes=[
+            Route("/sse", endpoint=handle_sse),
+            Mount("/messages", app=handle_messages),
+        ]
+    )
+    log.info(f"Starting fleet-mcp-server in SSE mode on port {port}")
+    config = uvicorn.Config(app, host="127.0.0.1", port=port)
+    s = uvicorn.Server(config)
+    await s.serve()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="fleet-mcp-server — MCP server for fleet operations",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "sse"],
+        default="stdio",
+        help="Transport mode (default: stdio)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8766,
+        help="Port for SSE mode (default: 8766)",
+    )
+    args = parser.parse_args()
+
+    # Ensure fleet directory exists
+    FLEET_DIR.mkdir(parents=True, exist_ok=True)
+    FLEET_INBOX.mkdir(parents=True, exist_ok=True)
+    FLEET_OUTBOX.mkdir(parents=True, exist_ok=True)
+
+    if not INVENTORY_FILE.exists():
+        log.warning(
+            f"Fleet inventory not found: {INVENTORY_FILE}\n"
+            "Create it from the template in skills/fleet-mcp-server/SKILL.md"
+        )
+
+    if args.transport == "sse":
+        asyncio.run(run_sse(args.port))
+    else:
+        asyncio.run(run_stdio())
+
+
+if __name__ == "__main__":
+    main()

@@ -1,49 +1,70 @@
-# USER Profile Template
+# USER Profile — [Full Name]
 
-> **Status:** Planned — Phase 3
-> **Tracking:** GAP_CLOSING_PLAN.md, Gap 3 (Per-User Context Routing)
-> **Target:** Per-user profile loaded by user-router to inject user context
+> Copy this file to `~/.openclaw/workspace/USERS/<platform>-<id>.md`
+> Example: `USERS/telegram-833846354.md`
+> Fill in all sections. Remove placeholder text in [brackets].
 
-<!-- Copy this file to templates/USERS/<platform>-<id>.md and fill it in -->
-<!-- Example: templates/USERS/telegram-833846354.md -->
+---
 
 ## Identity
 
-- **Name:** [Full name or handle]
-- **Identity:** [platform:id, e.g., telegram:833846354]
-- **Role:** [admin | user | readonly]
+- **Name:** [Full name or preferred handle]
+- **Role:** [owner | admin | operator | observer]
 - **Timezone:** [e.g., Australia/Melbourne]
-- **Language:** [Preferred response language]
+- **Language:** [en | fr | de | etc.]
+
+## Identities
+
+<!-- List all platform IDs for this person. user-router will match any of these. -->
+
+- telegram:[user_id]
+- discord:[user_id]
+- whatsapp:[+phone_number]
+- slack:[user_id]
 
 ## Context
 
-<!-- What the agent should know about this user -->
-<!-- This is injected into the system prompt for each turn from this user -->
+<!-- Injected into the system prompt for every turn from this user. -->
+<!-- Tell the agent who this person is and how to work with them best. -->
 
-- **Occupation:** [Role/job]
-- **Interests:** [What they typically ask about]
-- **Preferences:** [Communication style, detail level, etc.]
-- **Do not:** [Things to avoid]
+- **Occupation:** [Role/job title, e.g., "Software engineer at Acme Corp"]
+- **Expertise:** [Areas of expertise, e.g., "Python, DevOps, cloud infrastructure"]
+- **Common requests:** [What they typically ask the agent to do]
+- **Projects:** [Active projects context, e.g., "Building a SaaS product on AWS"]
 
-## Memory Namespace
+## Preferences
 
-<!-- Where this user's memory files are stored -->
+- **Communication style:** [concise | detailed | casual | formal]
+- **Response format:** [markdown | plain text | bullet points]
+- **Code style:** [Python preferred | TypeScript | etc.]
+- **Avoid:** [Things the agent should never do for this user]
+- **Always:** [Things the agent should always do for this user]
 
-- **Daily notes:** `~/.openclaw/users/<identity>/memory/YYYY-MM-DD.md`
-- **Long-term:** `~/.openclaw/users/<identity>/MEMORY.md`
-- **Projects:** `~/.openclaw/users/<identity>/projects/`
+## Memory
 
-## Permissions
+<!-- Where this user's private memory is stored. -->
+<!-- Leave as default or customize. -->
 
-<!-- Overrides from RBAC defaults, if any -->
-<!-- Usually inherited from role in TEAM.md -->
+- **Private memory:** `~/.openclaw/workspace/memory/users/[username]/`
+- **Daily notes:** `~/.openclaw/workspace/memory/users/[username]/YYYY-MM-DD.md`
+- **Long-term:** `~/.openclaw/workspace/memory/users/[username]/MEMORY.md`
 
-- **Role:** [admin | user | readonly]
-- **Extra permissions:** [none | specific skill overrides]
-- **Restrictions:** [none | specific skill blocks]
+## RBAC
+
+<!-- Role is set above under Identity. -->
+<!-- Add extra overrides here if needed — usually inherited from TEAM.md defaults. -->
+
+- **Role:** [Matches the role above — keep in sync with policy.csv]
+- **Extra permissions:** [none | list any extra scopes granted directly]
+- **Restrictions:** [none | list any scopes explicitly denied]
 
 ## Notes
 
-<!-- Operational notes specific to this user -->
+<!-- Operational notes the agent should be aware of. -->
 
-_Add user-specific context here._
+- [Add any additional context, quirks, or instructions here]
+
+---
+
+*Last updated: [YYYY-MM-DD]*
+*Updated by: [who updated this profile]*

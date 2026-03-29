@@ -1,56 +1,129 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = []
+# dependencies = [
+#     "casbin>=1.36.0",
+# ]
 # ///
 """
-check-auth — OpenClaw Phase 2 allowlist authorization check
+check-auth — OpenClaw Phase 3 Casbin RBAC authorization check
 
 Usage:
-    check-auth <identity>
+    check-auth <identity> [<resource> [<action>]]
 
 Arguments:
     identity    Sender identity in format platform:id
                 Examples: telegram:833846354, discord:987654321
+    resource    Resource being accessed (default: "skill_exec")
+                Scopes: skill_exec, config_write, fleet_manage,
+                        audit_read, secret_access, gateway_restart
+    action      Action on the resource (default: "*")
 
 Output:
-    PERMIT      Identity is authorized (or no allowlist file exists)
-    DENY        Identity is not in the allowlist
+    PERMIT      Identity is authorized
+    DENY        Identity is not authorized
 
 Exit codes:
     0           PERMIT
     1           DENY
     2           Usage error
 
+Modes:
+    Casbin RBAC  When ~/.openclaw/rbac/model.conf + policy.csv exist
+    Allowlist    Fallback when Casbin files are absent (backward compatible)
+
 Audit:
-    DENY events are logged to ~/.openclaw/audit/auth-denials.jsonl
+    All decisions are logged to ~/.openclaw/audit/YYYY-MM-DD.jsonl
+    DENY events are also written to ~/.openclaw/audit/auth-denials.jsonl
 """
 
-import sys
+from __future__ import annotations
+
 import json
+import sys
 import time
 from pathlib import Path
 
-AUTHORIZED_USERS_FILE = Path.home() / ".openclaw" / "authorized-users"
-AUDIT_DIR = Path.home() / ".openclaw" / "audit"
+# ── Paths ──────────────────────────────────────────────────────────────────
+OPENCLAW_DIR = Path.home() / ".openclaw"
+AUTHORIZED_USERS_FILE = OPENCLAW_DIR / "authorized-users"
+AUDIT_DIR = OPENCLAW_DIR / "audit"
 AUDIT_DENIALS_FILE = AUDIT_DIR / "auth-denials.jsonl"
+RBAC_DIR = OPENCLAW_DIR / "rbac"
+MODEL_CONF = RBAC_DIR / "model.conf"
+POLICY_CSV = RBAC_DIR / "policy.csv"
 
+# ── Default Casbin model (written if missing) ──────────────────────────────
+DEFAULT_MODEL_CONF = """\
+[request_definition]
+r = sub, obj, act
+
+[policy_definition]
+p = sub, obj, act
+
+[role_definition]
+g = _, _
+
+[policy_effect]
+e = some(where (p.eft == allow))
+
+[matchers]
+m = g(r.sub, p.sub) && (p.obj == "*" || r.obj == p.obj) && (p.act == "*" || r.act == p.act)
+"""
+
+# ── Default Casbin policy (written if missing) ─────────────────────────────
+DEFAULT_POLICY_CSV = """\
+# OpenClaw RBAC Policy
+# Format: p, <role>, <resource>, <action>
+#         g, <identity>, <role>
+#
+# Roles (hierarchy): owner > admin > operator > observer
+# Resources: skill_exec, config_write, fleet_manage, audit_read, secret_access, gateway_restart
+# Actions: * (wildcard matches all)
+
+# Owner: full access
+p, owner, *, *
+
+# Admin: all operational scopes except secret_access
+p, admin, skill_exec, *
+p, admin, config_write, *
+p, admin, fleet_manage, *
+p, admin, audit_read, *
+p, admin, gateway_restart, *
+
+# Operator: run skills, restart gateway, read audit
+p, operator, skill_exec, *
+p, operator, audit_read, *
+p, operator, gateway_restart, *
+
+# Observer: read audit only
+p, observer, audit_read, *
+
+# Role hierarchy
+g, admin, owner
+g, operator, admin
+g, observer, operator
+
+# User role assignments — customize for your deployment
+# g, telegram:833846354, owner
+"""
+
+
+# ── Audit helpers ──────────────────────────────────────────────────────────
 
 def _daily_audit_file() -> Path:
-    """Return path to today's structured audit log: ~/.openclaw/audit/YYYY-MM-DD.jsonl"""
     today = time.strftime("%Y-%m-%d", time.localtime())
     return AUDIT_DIR / f"{today}.jsonl"
 
 
-def write_audit_event(sender: str, result: str, reason: str) -> None:
-    """
-    Write an auth event to BOTH:
-      1. The daily structured audit log (~/.openclaw/audit/YYYY-MM-DD.jsonl)
-      2. The denials-only legacy log (~/.openclaw/audit/auth-denials.jsonl)
-
-    Standard audit entry format (from devops/audit-log.md):
-      ts, agent, sender, action, resource, args, result, reason
-    """
+def write_audit_event(
+    sender: str,
+    result: str,
+    reason: str,
+    resource: str = "check-auth",
+    action: str = "*",
+    mode: str = "casbin",
+) -> None:
     try:
         AUDIT_DIR.mkdir(parents=True, exist_ok=True)
         entry = {
@@ -58,95 +131,153 @@ def write_audit_event(sender: str, result: str, reason: str) -> None:
             "agent": "check-auth",
             "sender": sender,
             "action": "auth_check",
-            "resource": "check-auth",
-            "args": sender,
+            "resource": resource,
+            "args": f"{sender} {resource} {action}",
             "result": result,
             "reason": reason,
+            "mode": mode,
         }
-        # Write to daily structured log
         with _daily_audit_file().open("a") as f:
             f.write(json.dumps(entry) + "\n")
-        # Also write to denials-only log for backward compatibility
         if result == "DENY":
-            denial_entry = {
+            denial = {
                 "ts": entry["ts"],
                 "action": "auth_denied",
                 "sender": sender,
                 "reason": reason,
             }
             with AUDIT_DENIALS_FILE.open("a") as f:
-                f.write(json.dumps(denial_entry) + "\n")
+                f.write(json.dumps(denial) + "\n")
     except Exception as e:
         print(f"WARNING: could not write audit log: {e}", file=sys.stderr)
 
 
-def log_denial(sender: str, reason: str) -> None:
-    """Backward-compat wrapper — use write_audit_event instead."""
-    write_audit_event(sender, "DENY", reason)
-
+# ── Allowlist fallback ─────────────────────────────────────────────────────
 
 def load_allowlist(path: Path) -> set[str]:
-    """Parse the authorized-users file, ignoring comments and blank lines."""
     allowed: set[str] = set()
     with path.open() as f:
         for line in f:
             line = line.strip()
-            # Skip blank lines and comments
             if not line or line.startswith("#"):
                 continue
             allowed.add(line)
     return allowed
 
 
-def check_auth(identity: str) -> bool:
+def check_auth_allowlist(identity: str) -> tuple[bool, str]:
     """
-    Returns True if identity is permitted, False if denied.
-    If the authorized-users file doesn't exist, permits everyone.
+    Simple allowlist check — Phase 2 backward-compatible fallback.
+    Returns (permitted, reason).
     """
     if not AUTHORIZED_USERS_FILE.exists():
-        # No allowlist configured — opt-in security, default permit
-        return True
+        return True, "no allowlist configured — default permit"
 
     try:
         allowlist = load_allowlist(AUTHORIZED_USERS_FILE)
     except Exception as e:
-        # Fail CLOSED: if the file exists but can't be read, that's a security error.
-        # Silently permitting access when the allowlist is unreadable would disable
-        # all access control on disk errors or permission changes.
-        print(f"ERROR: authorized-users file exists but could not be read: {e}", file=sys.stderr)
-        print(f"ERROR: Failing closed (DENY) to preserve security posture", file=sys.stderr)
-        return False
+        print(
+            f"ERROR: authorized-users file exists but could not be read: {e}",
+            file=sys.stderr,
+        )
+        return False, f"allowlist unreadable — fail closed: {e}"
 
-    return identity in allowlist
+    if identity in allowlist:
+        return True, "user in allowlist"
+    return False, "user not in allowlist"
 
+
+# ── Casbin RBAC ────────────────────────────────────────────────────────────
+
+def ensure_casbin_defaults() -> None:
+    """Write default model.conf and policy.csv if they don't exist."""
+    RBAC_DIR.mkdir(parents=True, exist_ok=True)
+    if not MODEL_CONF.exists():
+        MODEL_CONF.write_text(DEFAULT_MODEL_CONF)
+        print(
+            f"INFO: Created default Casbin model at {MODEL_CONF}",
+            file=sys.stderr,
+        )
+    if not POLICY_CSV.exists():
+        POLICY_CSV.write_text(DEFAULT_POLICY_CSV)
+        print(
+            f"INFO: Created default Casbin policy at {POLICY_CSV}",
+            file=sys.stderr,
+        )
+
+
+def check_auth_casbin(
+    identity: str, resource: str, action: str
+) -> tuple[bool, str]:
+    """
+    Casbin RBAC check.
+    Returns (permitted, reason).
+    """
+    try:
+        import casbin  # type: ignore
+
+        ensure_casbin_defaults()
+        enforcer = casbin.Enforcer(str(MODEL_CONF), str(POLICY_CSV))
+        permitted: bool = enforcer.enforce(identity, resource, action)
+
+        if permitted:
+            # Determine effective role for logging
+            roles = enforcer.get_roles_for_user(identity)
+            role_str = ", ".join(roles) if roles else "direct policy match"
+            return True, f"casbin permit — roles: {role_str}"
+        else:
+            roles = enforcer.get_roles_for_user(identity)
+            role_str = ", ".join(roles) if roles else "no role assigned"
+            return False, f"casbin deny — {resource}/{action} not permitted for {role_str}"
+
+    except ImportError:
+        print(
+            "WARNING: pycasbin not available — falling back to allowlist",
+            file=sys.stderr,
+        )
+        return check_auth_allowlist(identity)
+    except Exception as e:
+        print(f"ERROR: Casbin check failed: {e}", file=sys.stderr)
+        return False, f"casbin error — fail closed: {e}"
+
+
+# ── Main ───────────────────────────────────────────────────────────────────
 
 def main() -> int:
-    if len(sys.argv) != 2 or sys.argv[1] in ("-h", "--help"):
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         print(__doc__.strip())
         return 2
 
     identity = sys.argv[1].strip()
+    resource = sys.argv[2].strip() if len(sys.argv) > 2 else "skill_exec"
+    action = sys.argv[3].strip() if len(sys.argv) > 3 else "*"
 
     if not identity:
         print("ERROR: identity cannot be empty", file=sys.stderr)
         return 2
 
-    # Validate format loosely
     if ":" not in identity:
         print(
             f"WARNING: identity '{identity}' doesn't look like platform:id format",
             file=sys.stderr,
         )
 
-    permitted = check_auth(identity)
+    # Decide which mode to use
+    use_casbin = MODEL_CONF.exists() and POLICY_CSV.exists()
+
+    if use_casbin:
+        permitted, reason = check_auth_casbin(identity, resource, action)
+        mode = "casbin"
+    else:
+        permitted, reason = check_auth_allowlist(identity)
+        mode = "allowlist"
 
     if permitted:
-        write_audit_event(identity, "PERMIT", "user in allowlist" if AUTHORIZED_USERS_FILE.exists() else "no allowlist configured")
+        write_audit_event(identity, "PERMIT", reason, resource, action, mode)
         print("PERMIT")
         return 0
     else:
-        reason = "user not in allowlist"
-        write_audit_event(identity, "DENY", reason)
+        write_audit_event(identity, "DENY", reason, resource, action, mode)
         print("DENY")
         return 1
 

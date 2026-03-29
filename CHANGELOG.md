@@ -14,6 +14,105 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [4.0.0-alpha] - 2026-03-29 (Phase 4 Complete)
+
+### Phase 4: MCP Fleet, NL Control, Swarm Orchestration
+
+#### Fleet MCP Server (`skills/fleet-mcp-server/`)
+
+- **NEW:** `skills/fleet-mcp-server/fleet-mcp-server` — UV script implementing a full
+  MCP server exposing 6 typed fleet tools to AI agents and MCP clients:
+  - `fleet_status` — list all machines with inventory health
+  - `fleet_health_check` — run health check on machines via fleet-agent
+  - `fleet_restart` — graceful or force restart of gateway on machines
+  - `fleet_update` — update component (gateway/skills/config/all) on machines
+  - `fleet_config_push` — validate and push config files to machines
+  - `fleet_logs` — retrieve recent gateway logs from a machine
+- HMAC-SHA256 command signing for all fleet operations
+- RBAC enforcement with `~/.openclaw/fleet/rbac.json`
+- Audit logging to `~/.openclaw/audit/fleet-mcp-server.jsonl`
+- Both stdio (MCP client) and SSE (HTTP) transport modes
+- **NEW:** `~/.openclaw/fleet/inventory.json` — fleet machine inventory template
+- **Updated:** `skills/fleet-mcp-server/SKILL.md` — full documentation replacing stub
+
+#### NL Fleet Commander (`workflows/fleet-commander/`)
+
+- **Updated:** `workflows/fleet-commander/AGENT.md` — full workflow definition replacing
+  stub. Implements:
+  - Natural language intent classification (keyword rules + learned overrides)
+  - Learning loop: records every classification, overrides static rules after ≥3 examples
+  - Autonomous health monitoring with auto-restart (max 3 attempts/hour)
+  - Escalation policy (alert human on >2 degraded machines, 3 restart failures)
+  - Full audit trail to `~/.openclaw/audit/fleet-commander.jsonl`
+- **NEW:** `workflows/fleet-commander/routing-rules.md` — static intent→operation mapping
+  for health/status, restart/recovery, updates, and diagnostics
+- **NEW:** `workflows/fleet-commander/patterns.json` — empty learning log seed template
+
+#### Fleet Command NL Mode (`.claude/commands/fleet.md`)
+
+- **Updated:** `version: 0.2.0` with two new sections:
+  - **Natural Language Mode** — routes unstructured commands to fleet-commander workflow
+  - **`--no-ssh` mode** — routes operations through fleet MCP server instead of SSH
+  - Includes decision table for SSH vs `--no-ssh` and prerequisites checklist
+
+#### Ruflo Integration Guide (`docs/RUFLO_SETUP.md`)
+
+- **Updated:** Full Ruflo swarm orchestration guide replacing stub:
+  - What Ruflo is and its queen/worker pattern
+  - Ruflo vs native fleet-commander decision table
+  - Installation (npx, global install, one-liner)
+  - openclaw-config topology mapping (atlas4=queen, forge4/vault4=workers)
+  - Docker deployment with 324MB lite image
+  - Docker Compose sidecar alongside OpenClaw gateway
+  - MCP bridge configuration linking Ruflo to fleet-mcp-server
+  - VPS sizing recommendations by fleet size
+  - Troubleshooting guide
+
+#### OPA Enterprise Policy Guide (`docs/OPA_SETUP.md`)
+
+- **Updated:** Full OPA setup guide replacing stub:
+  - OPA vs Casbin comparison matrix (complexity, audit, K8s, ecosystem)
+  - When to use each (decision criteria)
+  - Docker standalone and sidecar deployment
+  - Rego policy examples (authz.rego, fleet.rego) with time-based access control
+  - Agent data format for OPA (`data/agents.json`)
+  - `opa test` policy testing patterns
+  - OPA integration hook for fleet-mcp-server (drop-in RBAC replacement)
+  - OPA decision logging configuration
+  - 3-phase Casbin→OPA migration path with timeline
+
+#### Agent Swarm Orchestration (`workflows/agent-swarm/`)
+
+- **NEW:** `workflows/agent-swarm/AGENT.md` — full swarm orchestration workflow:
+  - Task decomposition algorithm (classify → identify parallel sub-tasks → assign models)
+  - Parallel execution with concurrency limit (max 4 workers, cost guard at $5)
+  - Health monitoring + auto-respawn (max 3 attempts, stalled/failed/timeout states)
+  - Result aggregation with per-task-type quality checks
+  - Learning loop (records quality/cost/latency, updates routing after ≥3 data points)
+  - Triple code review pattern for security-critical work
+  - Cost estimation and confirmation thresholds
+- **NEW:** `workflows/agent-swarm/routing-matrix.md` — default task→model routing table:
+  - 12 task types: code generation, review, research, docs, testing, security audit, etc.
+  - Model aliases (opus/sonnet/haiku/sonar-pro/sonar)
+  - Routing rules (security always uses opus, monitoring always uses haiku, etc.)
+  - Cost budget estimates by swarm type
+- **NEW:** `workflows/agent-swarm/learning-log.json` — seed template for performance tracking
+
+#### Phase 4 Tests (`tests/phase4-validation.sh`)
+
+- **NEW:** 64 automated validation tests covering all Phase 4 deliverables:
+  - Fleet MCP server: script existence, executability, 6 tool definitions, HMAC, audit, transport
+  - Inventory: existence, valid JSON, schema
+  - Fleet commander: non-stub content, learning loop, MCP tool references, routing rules
+  - Fleet command: NL mode section, `--no-ssh` documentation
+  - Ruflo guide: non-stub, queen/worker, Docker, MCP, fleet-commander, installation
+  - OPA guide: non-stub, Rego, Casbin, Docker, migration, sidecar
+  - Agent swarm: non-stub, learning, respawn, parallel, aggregation, quality
+  - Routing matrix: all 6 task types present
+  - JSON validity checks for all JSON files
+
+---
+
 ## [2.0.0-alpha] - 2026-03-28 (Phase 2 Complete)
 
 ### Critical Bug Fixes

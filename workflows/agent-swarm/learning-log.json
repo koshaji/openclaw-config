@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "description": "Seed template — copy to ~/.openclaw/swarm/learning-log.json on first use",
+  "overrides": {},
+  "runs": [],
+  "last_updated": null,
+  "stats": {
+    "total_runs": 0,
+    "total_cost_usd": 0.0,
+    "avg_quality_score": null,
+    "models_used": {}
+  }
+}

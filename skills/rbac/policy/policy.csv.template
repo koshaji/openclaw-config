@@ -1,0 +1,61 @@
+# OpenClaw RBAC Policy Template
+# Copy to ~/.openclaw/rbac/policy.csv and customize.
+#
+# Format:
+#   p, <role>, <resource>, <action>   — permission rule
+#   g, <identity>, <role>             — role assignment
+#
+# Role hierarchy (built-in inheritance):
+#   owner > admin > operator > observer
+#   (Each role inherits all permissions of the roles below it.)
+#
+# Resource scopes:
+#   skill_exec      — run any skill
+#   config_write    — write to ~/.openclaw/config files
+#   fleet_manage    — manage fleet agents
+#   audit_read      — read audit logs
+#   secret_access   — access secrets via Vault4 / 1Password
+#   gateway_restart — restart the OpenClaw gateway
+#
+# Use * as a wildcard for resource or action.
+
+# ── Role permissions ────────────────────────────────────────────────────────
+
+# Owner: unrestricted access to everything
+p, owner, *, *
+
+# Admin: all operational scopes (no secret_access — requires owner)
+p, admin, skill_exec, *
+p, admin, config_write, *
+p, admin, fleet_manage, *
+p, admin, audit_read, *
+p, admin, gateway_restart, *
+
+# Operator: run skills, restart gateway, read audit
+p, operator, skill_exec, *
+p, operator, audit_read, *
+p, operator, gateway_restart, *
+
+# Observer: read-only access to audit logs
+p, observer, audit_read, *
+
+# ── Role hierarchy ──────────────────────────────────────────────────────────
+# Casbin role inheritance: g, child_role, parent_role
+# This means admin inherits owner perms, operator inherits admin perms, etc.
+# NOTE: The hierarchy below is additive/explicit — remove if you want strict isolation.
+
+# (Optional) Uncomment to enable role inheritance:
+# g, admin, owner
+# g, operator, admin
+# g, observer, operator
+
+# ── User assignments ────────────────────────────────────────────────────────
+# Assign identities to roles. Format: g, <platform:id>, <role>
+
+g, telegram:833846354, owner
+
+# Examples:
+# g, telegram:111222333, admin
+# g, discord:987654321, operator
+# g, slack:U012AB3CD, observer
+# g, whatsapp:+61400000000, observer

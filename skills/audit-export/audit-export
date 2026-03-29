@@ -1,10 +1,12 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = []
+# dependencies = [
+#     "boto3>=1.34.0; sys_platform != 'impossible'",
+# ]
 # ///
 """
-audit-export — OpenClaw audit log export and analysis tool
+audit-export — OpenClaw audit log export, analysis, and integrity verification
 
 Usage:
     audit-export [OPTIONS]
@@ -16,6 +18,9 @@ Options:
     --action TYPE       Filter by action type
     --format FORMAT     Output format: json (default), csv, text
     --output PATH       Write to file instead of stdout
+    --verify            Verify hash-chain integrity of the audit log
+    --export-s3 URI     Export to S3 (s3://bucket/prefix) — requires boto3 + AWS creds
+    --export-syslog     Forward entries to syslog (facility: LOG_LOCAL0)
     --help              Show this help
 
 Examples:
@@ -23,6 +28,15 @@ Examples:
     audit-export --days 30 --action auth_denied
     audit-export --agent atlas4 --format text
     audit-export --days 30 --format csv --output ~/audit.csv
+    audit-export --verify --days 30
+    audit-export --days 7 --export-syslog
+    audit-export --days 30 --export-s3 s3://my-bucket/openclaw/audit/
+
+Hash-chain integrity:
+    Phase 3 audit entries contain:
+      "prev_hash": SHA-256 of the previous entry's serialized content
+      "hash":      SHA-256 of (entry_content + prev_hash)
+    The --verify flag walks the chain and reports any breaks.
 """
 
 from __future__ import annotations
@@ -30,17 +44,23 @@ from __future__ import annotations
 import argparse
 import csv
 import gzip
+import hashlib
 import json
 import sys
+import syslog
 from datetime import date, datetime, timedelta, timezone
-from io import StringIO
 from pathlib import Path
 
 AUDIT_DIR = Path.home() / ".openclaw" / "audit"
 
 # CSV column order — fixed headers for consistent output
-CSV_COLUMNS = ["ts", "agent", "user", "action", "skill", "args", "session", "result", "reason", "sender", "error", "duration_ms"]
+CSV_COLUMNS = [
+    "ts", "agent", "user", "action", "skill", "args", "session",
+    "result", "reason", "sender", "error", "duration_ms", "hash", "prev_hash",
+]
 
+
+# ── File iteration ─────────────────────────────────────────────────────────
 
 def iter_log_file(path: Path):
     """Yield parsed JSON objects from a .jsonl or .jsonl.gz file."""
@@ -64,7 +84,6 @@ def get_date_paths(audit_dir: Path, dates: list[date]) -> list[Path]:
     paths = []
     for d in sorted(dates):
         ds = d.strftime("%Y-%m-%d")
-        # Prefer uncompressed; fall back to compressed
         plain = audit_dir / f"{ds}.jsonl"
         compressed = audit_dir / f"{ds}.jsonl.gz"
         if plain.exists():
@@ -91,6 +110,73 @@ def load_entries(
     return entries
 
 
+# ── Hash chain ─────────────────────────────────────────────────────────────
+
+def entry_content_for_hash(entry: dict) -> str:
+    """
+    Canonical serialization for hashing.
+    Excludes 'hash' and 'prev_hash' fields — they're the chain metadata, not content.
+    Fields are sorted for determinism.
+    """
+    content = {k: v for k, v in entry.items() if k not in ("hash", "prev_hash")}
+    return json.dumps(content, sort_keys=True, separators=(",", ":"))
+
+
+def compute_entry_hash(entry: dict, prev_hash: str) -> str:
+    """Compute SHA-256 of (entry_content + prev_hash)."""
+    content = entry_content_for_hash(entry) + prev_hash
+    return "sha256:" + hashlib.sha256(content.encode()).hexdigest()
+
+
+def verify_hash_chain(entries: list[dict]) -> tuple[bool, list[str]]:
+    """
+    Verify the hash chain across all entries (sorted by ts).
+    Returns (ok, list_of_errors).
+    An empty error list means the chain is intact.
+    """
+    errors: list[str] = []
+    prev_hash = "genesis"
+
+    for i, entry in enumerate(entries):
+        stored_prev = entry.get("prev_hash")
+        stored_hash = entry.get("hash")
+
+        # Entries without hash fields are pre-Phase-3 — skip chain check
+        if stored_hash is None and stored_prev is None:
+            # Recompute prev_hash as if this entry existed in the chain
+            # (so the next hashed entry can still validate against it)
+            computed = compute_entry_hash(entry, prev_hash)
+            prev_hash = computed
+            continue
+
+        # Check prev_hash linkage
+        if stored_prev is not None and stored_prev != prev_hash:
+            ts = entry.get("ts", "?")
+            agent = entry.get("agent", "?")
+            errors.append(
+                f"Entry {i} (ts={ts}, agent={agent}): "
+                f"prev_hash mismatch — stored={stored_prev!r}, expected={prev_hash!r}"
+            )
+
+        # Verify current hash
+        if stored_hash is not None:
+            expected_hash = compute_entry_hash(entry, prev_hash)
+            if stored_hash != expected_hash:
+                ts = entry.get("ts", "?")
+                agent = entry.get("agent", "?")
+                errors.append(
+                    f"Entry {i} (ts={ts}, agent={agent}): "
+                    f"hash mismatch — stored={stored_hash!r}, expected={expected_hash!r}"
+                )
+            prev_hash = stored_hash
+        else:
+            prev_hash = compute_entry_hash(entry, prev_hash)
+
+    return len(errors) == 0, errors
+
+
+# ── Output formatters ──────────────────────────────────────────────────────
+
 def format_ts(ts: int) -> str:
     """Format unix timestamp as UTC datetime string."""
     try:
@@ -113,7 +199,6 @@ def output_csv(entries: list[dict], out) -> None:
     )
     writer.writeheader()
     for entry in entries:
-        # Serialize args list as JSON string for CSV
         row = dict(entry)
         if "args" in row and isinstance(row["args"], list):
             row["args"] = json.dumps(row["args"])
@@ -154,6 +239,97 @@ def output_text(entries: list[dict], out) -> None:
         out.write(" ".join(parts) + "\n")
 
 
+# ── S3 export ──────────────────────────────────────────────────────────────
+
+def export_to_s3(entries: list[dict], s3_uri: str) -> None:
+    """
+    Export entries to S3.
+
+    Requires: boto3, AWS credentials (env vars or ~/.aws/credentials).
+
+    s3_uri format: s3://bucket-name/optional/prefix/
+
+    Writes a single JSONL file:
+      s3://bucket/prefix/openclaw-audit-YYYY-MM-DD.jsonl
+    """
+    try:
+        import boto3  # type: ignore
+    except ImportError:
+        print(
+            "ERROR: boto3 is required for S3 export. "
+            "Install with: pip install boto3 (or add to UV inline deps)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    if not s3_uri.startswith("s3://"):
+        print(f"ERROR: S3 URI must start with s3:// — got: {s3_uri}", file=sys.stderr)
+        sys.exit(2)
+
+    # Parse bucket and prefix
+    without_scheme = s3_uri[5:]
+    parts = without_scheme.split("/", 1)
+    bucket = parts[0]
+    prefix = parts[1].rstrip("/") + "/" if len(parts) > 1 else ""
+
+    # Build key
+    today = date.today().strftime("%Y-%m-%d")
+    key = f"{prefix}openclaw-audit-{today}.jsonl"
+
+    # Serialize
+    content = "\n".join(json.dumps(e) for e in entries) + "\n"
+
+    try:
+        s3 = boto3.client("s3")
+        s3.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=content.encode("utf-8"),
+            ContentType="application/x-ndjson",
+            ServerSideEncryption="AES256",
+        )
+        print(
+            f"Exported {len(entries)} entries to s3://{bucket}/{key}",
+            file=sys.stderr,
+        )
+    except Exception as e:
+        print(f"ERROR: S3 export failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+# ── Syslog export ──────────────────────────────────────────────────────────
+
+def export_to_syslog(entries: list[dict]) -> None:
+    """
+    Forward audit entries to syslog (facility: LOG_LOCAL0).
+
+    Each entry is serialized as a single JSON line.
+    Priority mapping:
+      result=DENY or result=ERROR → LOG_WARNING
+      result=PERMIT or result=OK  → LOG_INFO
+      everything else             → LOG_NOTICE
+    """
+    syslog.openlog("openclaw-audit", syslog.LOG_PID, syslog.LOG_LOCAL0)
+    try:
+        count = 0
+        for entry in entries:
+            result = str(entry.get("result", "")).upper()
+            if result in ("DENY", "ERROR"):
+                priority = syslog.LOG_WARNING
+            elif result in ("PERMIT", "OK"):
+                priority = syslog.LOG_INFO
+            else:
+                priority = syslog.LOG_NOTICE
+
+            syslog.syslog(priority, json.dumps(entry))
+            count += 1
+        print(f"Forwarded {count} entries to syslog (LOG_LOCAL0)", file=sys.stderr)
+    finally:
+        syslog.closelog()
+
+
+# ── Argument parsing ───────────────────────────────────────────────────────
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Export and filter OpenClaw audit logs",
@@ -165,8 +341,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--action", metavar="TYPE", help="Filter by action type")
     parser.add_argument("--format", choices=["json", "csv", "text"], default="json", dest="fmt")
     parser.add_argument("--output", metavar="PATH", help="Write to file (default: stdout)")
+    parser.add_argument("--verify", action="store_true", help="Verify hash-chain integrity")
+    parser.add_argument("--export-s3", metavar="URI", dest="export_s3", help="Export to S3 URI (s3://bucket/prefix/)")
+    parser.add_argument("--export-syslog", action="store_true", dest="export_syslog", help="Forward to syslog (LOG_LOCAL0)")
     return parser.parse_args(argv)
 
+
+# ── Main ───────────────────────────────────────────────────────────────────
 
 def main() -> int:
     args = parse_args(sys.argv[1:])
@@ -192,7 +373,34 @@ def main() -> int:
     # Sort by timestamp
     entries.sort(key=lambda e: e.get("ts", 0))
 
-    # Determine output destination
+    # ── Verify mode ────────────────────────────────────────────────────────
+    if args.verify:
+        ok, errors = verify_hash_chain(entries)
+        if ok:
+            print(f"✓ Hash chain intact across {len(entries)} entries.")
+            return 0
+        else:
+            print(f"✗ Hash chain BROKEN — {len(errors)} integrity error(s):", file=sys.stderr)
+            for err in errors:
+                print(f"  - {err}", file=sys.stderr)
+            print(
+                "\nThis may indicate log tampering, file corruption, or entries written "
+                "without the hash-chain feature enabled.",
+                file=sys.stderr,
+            )
+            return 1
+
+    # ── S3 export ──────────────────────────────────────────────────────────
+    if args.export_s3:
+        export_to_s3(entries, args.export_s3)
+        return 0
+
+    # ── Syslog export ──────────────────────────────────────────────────────
+    if args.export_syslog:
+        export_to_syslog(entries)
+        return 0
+
+    # ── Standard output ────────────────────────────────────────────────────
     if args.output:
         out_path = Path(args.output)
         out_path.parent.mkdir(parents=True, exist_ok=True)

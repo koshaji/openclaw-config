@@ -180,6 +180,7 @@ def check_auth_allowlist(identity: str) -> tuple[bool, str]:
             f"ERROR: authorized-users file exists but could not be read: {e}",
             file=sys.stderr,
         )
+        # Failing closed — deny access when allowlist cannot be read
         return False, f"allowlist unreadable — fail closed: {e}"
 
     if identity in allowlist:

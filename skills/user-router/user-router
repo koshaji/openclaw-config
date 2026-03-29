@@ -92,7 +92,7 @@ def parse_profile(path: Path) -> dict:
     # Extract fields from "- **Key:** Value" format
     field_pattern = re.compile(r"^\s*[-*]\s+\*\*([^*]+)\*\*[:\s]+(.+)", re.MULTILINE)
     for m in field_pattern.finditer(text):
-        key = m.group(1).strip().lower()
+        key = m.group(1).strip().lower().rstrip(":")
         value = m.group(2).strip()
         if value.startswith("[") and value.endswith("]"):
             continue  # skip unfilled template placeholders

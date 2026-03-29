@@ -101,6 +101,45 @@ COSTS_DIR = OPENCLAW_DIR / "costs"
 PRICING_FILE = COSTS_DIR / "pricing.json"
 AGENTS_DIR = OPENCLAW_DIR / "agents"
 
+# ---------------------------------------------------------------------------
+# VERIFIED SESSION LOG SCHEMA (C3 verification — 2026-03-28)
+# ---------------------------------------------------------------------------
+# Verified against real session logs in ~/.openclaw/agents/*/sessions/*.jsonl
+#
+# Each line in a session JSONL file is one of these event types:
+#   type="session"  — session metadata (version, cwd, timestamp)
+#   type="message"  — an LLM turn (user or assistant)
+#   type="model_change" — model switch within session
+#   type="custom"   — custom events
+#
+# USAGE DATA is present on type="message" lines where the assistant called
+# the LLM API. The relevant fields (all at top level of the JSON object):
+#
+#   {
+#     "type": "message",
+#     "id": "<8-char hex>",
+#     "timestamp": "2026-03-22T04:01:14.894Z",   ← ISO 8601 UTC
+#     "provider": "anthropic",                    ← provider prefix
+#     "model": "claude-opus-4-6",                 ← model ID (no prefix)
+#     "usage": {
+#       "input": 12345,        ← input tokens
+#       "output": 678,         ← output tokens
+#       "cacheRead": 9000,     ← cache read tokens (Anthropic prompt caching)
+#       "cacheWrite": 300,     ← cache write tokens
+#       "total": 22323         ← total tokens (sum of above)
+#     }
+#   }
+#
+# NOTE: Many entries have usage.input=0, usage.output=0 — these are
+# NO_REPLY heartbeat messages and other non-substantive turns. They are
+# included in the count but contribute $0.00 cost, which is correct.
+#
+# The cost-tracker correctly reads: usage.input, usage.output,
+# usage.cacheRead, usage.cacheWrite — matching the verified schema above.
+#
+# Model key normalisation: provider="anthropic" + model="claude-opus-4-6"
+# → key="anthropic/claude-opus-4-6" matches DEFAULT_PRICING keys. ✓
+
 
 # ---------------------------------------------------------------------------
 # Helpers

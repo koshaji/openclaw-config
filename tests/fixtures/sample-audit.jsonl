@@ -1,0 +1,5 @@
+{"ts":1743120000,"agent":"check-auth","sender":"telegram:833846354","action":"auth_check","resource":"check-auth","args":"telegram:833846354","result":"PERMIT","reason":"user in allowlist"}
+{"ts":1743120060,"agent":"check-auth","sender":"telegram:999999999","action":"auth_check","resource":"check-auth","args":"telegram:999999999","result":"DENY","reason":"user not in allowlist"}
+{"ts":1743120120,"agent":"atlas4","sender":"telegram:833846354","action":"skill_exec","resource":"cost-tracker","args":"--days 7","result":"success","reason":""}
+{"ts":1743120180,"agent":"atlas4","sender":"telegram:833846354","action":"gateway_restart","resource":"openclaw-gateway","args":"","result":"success","reason":"scheduled maintenance"}
+{"ts":1743120240,"agent":"check-auth","sender":"discord:111222333","action":"auth_check","resource":"check-auth","args":"discord:111222333","result":"DENY","reason":"user not in allowlist"}

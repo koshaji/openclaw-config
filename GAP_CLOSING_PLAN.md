@@ -110,7 +110,7 @@ genuinely open problems.
 
 #### Current State
 
-`devops/fleet.md` (via `.claude/commands/fleet.md`) manages remote machines using direct
+`.claude/commands/fleet.md` manages remote machines using direct
 SSH connections over Tailscale. Every fleet operation — health checks, updates, restarts,
 config pushes — requires an active SSH session to each machine.
 

@@ -44,7 +44,7 @@ current_fails=$(read_fails)
 new_fails=$((current_fails + 1))
 write_fails "$new_fails"
 
-log "Health check FAILED (consecutive failures: $new_fails / $THRESHOLD)"
+log "Health check FAILED (consecutive failures: $new_fails / $FAIL_THRESHOLD)"
 
 if [[ "$new_fails" -lt "$FAIL_THRESHOLD" ]]; then
     log "Below threshold ($FAIL_THRESHOLD), waiting for next cycle"

@@ -34,6 +34,15 @@ ExecStop=/bin/bash -c '\
   export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"; \
   openclaw gateway stop'
 
+# FIXED (issue m3): watchdog-notify.sh is an infinite loop.
+# If run via ExecStartPost without backgrounding, systemd waits for it to
+# finish and the service never reaches "started" state.
+# Option A (recommended): use a separate openclaw-watchdog-notify.service
+#   that depends on this unit. See devops/linux/openclaw-watchdog-notify.service
+# Option B (quick fix): background the script here:
+#   ExecStartPost=/bin/bash -c 'scripts/watchdog-notify.sh &'
+# We use Option A — see openclaw-watchdog-notify.service
+
 # Logging: errors go to a dedicated log file for easy inspection
 StandardOutput=journal
 StandardError=append:%h/.openclaw/logs/gateway-errors.log

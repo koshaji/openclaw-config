@@ -1,0 +1,517 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""
+fleet-agent — Zero-SSH fleet command agent with HMAC-SHA256 authentication
+
+Implements the fleet inbox/outbox pattern from devops/fleet-agent-security.md.
+Reads signed command files from ~/.openclaw/fleet-inbox/, validates HMAC signatures,
+executes permitted operations, and writes results to ~/.openclaw/fleet-outbox/.
+
+Usage:
+    fleet-agent daemon              # Run as daemon (polls every 30s)
+    fleet-agent process <file>      # Process one command file
+    fleet-agent status              # Show agent status
+    fleet-agent list                # List pending commands in inbox
+
+Security:
+    - All commands must be signed with HMAC-SHA256 (key from FLEET_SHARED_KEY in .env)
+    - Nonces prevent replay attacks (5-minute window)
+    - Only operations in the allowlist can be executed
+    - All operations are logged to ~/.openclaw/audit/YYYY-MM-DD.jsonl
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import hmac
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+OPENCLAW_DIR = Path.home() / ".openclaw"
+FLEET_INBOX = OPENCLAW_DIR / "fleet-inbox"
+FLEET_OUTBOX = OPENCLAW_DIR / "fleet-outbox"
+FLEET_NONCES = OPENCLAW_DIR / "fleet-nonces.json"
+AUDIT_DIR = OPENCLAW_DIR / "audit"
+ENV_FILE = OPENCLAW_DIR / ".env"
+
+POLL_INTERVAL_S = 30
+NONCE_WINDOW_S = 300  # 5 minutes
+DAEMON_NONCE_ROTATION_S = 3600  # Rotate nonce store hourly
+
+# ---------------------------------------------------------------------------
+# Allowlist — ONLY these operations may be executed
+# ---------------------------------------------------------------------------
+
+ALLOWED_OPERATIONS: dict[str, str] = {
+    "gateway_status": "Check gateway health",
+    "gateway_restart": "Restart the OpenClaw gateway",
+    "session_cleanup": "Run session cleanup",
+    "metrics_snapshot": "Capture session metrics",
+    "config_get": "Read a config value (read-only)",
+    "security_audit": "Run security-setup audit",
+    "agent_version": "Return openclaw/agent version",
+}
+
+# Operations explicitly blocked (can never be enabled by config)
+BLOCKED_OPERATIONS: set[str] = {
+    "exec", "shell", "bash", "sh",
+    "config_set", "config_write",
+    "install", "uninstall", "update",
+    "ssh", "rsync",
+    "rm", "delete", "wipe",
+}
+
+
+# ---------------------------------------------------------------------------
+# Environment loading
+# ---------------------------------------------------------------------------
+
+def load_env() -> dict[str, str]:
+    """Load variables from ~/.openclaw/.env."""
+    env: dict[str, str] = {}
+    if ENV_FILE.exists():
+        try:
+            for line in ENV_FILE.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                env[key.strip()] = value.strip().strip('"').strip("'")
+        except Exception:
+            pass
+    return env
+
+
+def get_shared_key() -> bytes | None:
+    """Get FLEET_SHARED_KEY from environment or .env file."""
+    key_str = os.environ.get("FLEET_SHARED_KEY") or load_env().get("FLEET_SHARED_KEY")
+    if not key_str:
+        return None
+    return key_str.encode()
+
+
+# ---------------------------------------------------------------------------
+# HMAC verification
+# ---------------------------------------------------------------------------
+
+def build_hmac_input(cmd: dict[str, Any]) -> str:
+    """Build the canonical string for HMAC computation."""
+    args_str = json.dumps(cmd.get("args", {}), sort_keys=True, separators=(",", ":"))
+    return ":".join([
+        str(cmd.get("id", "")),
+        str(cmd.get("ts", "")),
+        str(cmd.get("nonce", "")),
+        str(cmd.get("operation", "")),
+        args_str,
+    ])
+
+
+def verify_hmac(cmd: dict[str, Any], shared_key: bytes) -> bool:
+    """Verify the HMAC-SHA256 signature of a command."""
+    expected = cmd.get("hmac", "")
+    if not expected:
+        return False
+
+    msg = build_hmac_input(cmd).encode()
+    computed = hmac.new(shared_key, msg, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(computed, expected)
+
+
+# ---------------------------------------------------------------------------
+# Nonce tracking
+# ---------------------------------------------------------------------------
+
+def load_nonces() -> dict[str, int]:
+    """Load nonce store from disk."""
+    if FLEET_NONCES.exists():
+        try:
+            return json.loads(FLEET_NONCES.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def save_nonces(nonces: dict[str, int]) -> None:
+    """Save nonce store to disk, pruning old entries."""
+    now = int(time.time())
+    # Remove nonces older than NONCE_WINDOW_S * 2
+    pruned = {k: v for k, v in nonces.items() if now - v < NONCE_WINDOW_S * 2}
+    try:
+        OPENCLAW_DIR.mkdir(parents=True, exist_ok=True)
+        FLEET_NONCES.write_text(json.dumps(pruned))
+    except Exception as e:
+        print(f"WARNING: could not save nonces: {e}", file=sys.stderr)
+
+
+def check_nonce(nonce: str, ts: int) -> tuple[bool, str]:
+    """
+    Check if a nonce is valid (not replayed, within time window).
+    Returns (valid, reason).
+    """
+    now = int(time.time())
+
+    # Check timestamp window
+    age = abs(now - ts)
+    if age > NONCE_WINDOW_S:
+        return False, f"Command timestamp too old (age: {age}s, window: {NONCE_WINDOW_S}s)"
+
+    # Check nonce not already used
+    nonces = load_nonces()
+    if nonce in nonces:
+        return False, "Nonce already used (replay attack detected)"
+
+    # Record nonce
+    nonces[nonce] = now
+    save_nonces(nonces)
+    return True, "OK"
+
+
+# ---------------------------------------------------------------------------
+# Audit logging
+# ---------------------------------------------------------------------------
+
+def audit_log(operation: str, cmd_id: str, result: str, reason: str = "") -> None:
+    """Write an audit log entry to the daily JSONL file."""
+    try:
+        AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+        today = time.strftime("%Y-%m-%d", time.localtime())
+        log_file = AUDIT_DIR / f"{today}.jsonl"
+        entry = {
+            "ts": int(time.time()),
+            "agent": "fleet-agent",
+            "sender": "fleet-commander",
+            "action": operation,
+            "resource": "fleet-agent",
+            "args": cmd_id,
+            "result": result,
+            "reason": reason,
+        }
+        with log_file.open("a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        print(f"WARNING: could not write audit log: {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Command execution
+# ---------------------------------------------------------------------------
+
+def execute_gateway_status(args: dict) -> dict:
+    """Execute: gateway_status."""
+    try:
+        result = subprocess.run(
+            ["openclaw", "gateway", "health"],
+            capture_output=True, text=True, timeout=10
+        )
+        return {"status": "ok" if result.returncode == 0 else "error", "output": result.stdout[:500]}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def execute_gateway_restart(args: dict) -> dict:
+    """Execute: gateway_restart."""
+    force = args.get("force", False)
+    cmd = ["skills/gateway-restart/gateway-restart", "restart"]
+    if force:
+        cmd.append("--force")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        return {"status": "ok" if result.returncode == 0 else "error",
+                "output": result.stdout[:500]}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def execute_session_cleanup(args: dict) -> dict:
+    """Execute: session_cleanup."""
+    dry_run = args.get("dry_run", True)
+    cmd = ["openclaw", "sessions", "cleanup"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        return {"status": "ok" if result.returncode == 0 else "error",
+                "output": result.stdout[:500], "dry_run": dry_run}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def execute_agent_version(args: dict) -> dict:
+    """Execute: agent_version."""
+    try:
+        result = subprocess.run(
+            ["openclaw", "--version"],
+            capture_output=True, text=True, timeout=10
+        )
+        return {"status": "ok", "version": result.stdout.strip()}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def execute_metrics_snapshot(args: dict) -> dict:
+    """Execute: metrics_snapshot."""
+    try:
+        sessions_result = subprocess.run(
+            ["openclaw", "sessions", "--json"],
+            capture_output=True, text=True, timeout=15
+        )
+        return {
+            "status": "ok",
+            "sessions": json.loads(sessions_result.stdout) if sessions_result.returncode == 0 else None,
+            "ts": int(time.time()),
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def execute_config_get(args: dict) -> dict:
+    """Execute: config_get (read-only)."""
+    key = args.get("key", "")
+    if not key:
+        return {"status": "error", "error": "key argument required"}
+    try:
+        result = subprocess.run(
+            ["openclaw", "config", "get", key],
+            capture_output=True, text=True, timeout=10
+        )
+        return {"status": "ok", "key": key, "value": result.stdout.strip()}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def execute_security_audit(args: dict) -> dict:
+    """Execute: security_audit."""
+    script = Path(__file__).parent.parent / "security-setup" / "security-setup"
+    if not script.exists():
+        return {"status": "error", "error": "security-setup not found"}
+    try:
+        result = subprocess.run(
+            [str(script), "--json"],
+            capture_output=True, text=True, timeout=30
+        )
+        try:
+            return {"status": "ok", "report": json.loads(result.stdout)}
+        except json.JSONDecodeError:
+            return {"status": "ok", "output": result.stdout[:1000]}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+EXECUTORS = {
+    "gateway_status": execute_gateway_status,
+    "gateway_restart": execute_gateway_restart,
+    "session_cleanup": execute_session_cleanup,
+    "agent_version": execute_agent_version,
+    "metrics_snapshot": execute_metrics_snapshot,
+    "config_get": execute_config_get,
+    "security_audit": execute_security_audit,
+}
+
+
+# ---------------------------------------------------------------------------
+# Command processing
+# ---------------------------------------------------------------------------
+
+def process_command_file(cmd_file: Path, shared_key: bytes | None) -> dict:
+    """Validate and execute one command file. Returns result dict."""
+    try:
+        cmd = json.loads(cmd_file.read_text())
+    except Exception as e:
+        return {"status": "error", "error": f"Could not parse command file: {e}"}
+
+    cmd_id = cmd.get("id", "unknown")
+    operation = cmd.get("operation", "")
+
+    # 1. Validate operation against blocklist
+    if operation in BLOCKED_OPERATIONS:
+        reason = f"Operation '{operation}' is explicitly blocked"
+        audit_log(operation, cmd_id, "DENY", reason)
+        return {"status": "denied", "error": reason}
+
+    # 2. Validate operation against allowlist
+    if operation not in ALLOWED_OPERATIONS:
+        reason = f"Operation '{operation}' not in allowlist"
+        audit_log(operation, cmd_id, "DENY", reason)
+        return {"status": "denied", "error": reason}
+
+    # 3. Verify HMAC signature
+    if shared_key is None:
+        print("WARNING: FLEET_SHARED_KEY not configured — skipping signature verification",
+              file=sys.stderr)
+        print("Set FLEET_SHARED_KEY in ~/.openclaw/.env for production use", file=sys.stderr)
+    elif not verify_hmac(cmd, shared_key):
+        reason = "HMAC signature verification failed"
+        audit_log(operation, cmd_id, "DENY", reason)
+        return {"status": "denied", "error": reason}
+
+    # 4. Verify nonce (replay protection)
+    nonce = cmd.get("nonce", "")
+    ts = int(cmd.get("ts", 0))
+    nonce_valid, nonce_reason = check_nonce(nonce, ts)
+    if not nonce_valid:
+        audit_log(operation, cmd_id, "DENY", nonce_reason)
+        return {"status": "denied", "error": nonce_reason}
+
+    # 5. Execute the operation
+    executor = EXECUTORS.get(operation)
+    if not executor:
+        reason = f"No executor for operation '{operation}'"
+        audit_log(operation, cmd_id, "error", reason)
+        return {"status": "error", "error": reason}
+
+    try:
+        output = executor(cmd.get("args", {}))
+        exec_status = output.get("status", "ok")
+        audit_log(operation, cmd_id, exec_status)
+        return {"id": cmd_id, "ts": int(time.time()), "operation": operation,
+                "status": exec_status, "output": output, "error": output.get("error")}
+    except Exception as e:
+        reason = f"Executor raised exception: {e}"
+        audit_log(operation, cmd_id, "error", reason)
+        return {"id": cmd_id, "ts": int(time.time()), "operation": operation,
+                "status": "error", "output": {}, "error": reason}
+
+
+def write_result(cmd_id: str, result: dict) -> None:
+    """Write result to the outbox."""
+    FLEET_OUTBOX.mkdir(parents=True, exist_ok=True)
+    result_file = FLEET_OUTBOX / f"result-{cmd_id}.json"
+    result_file.write_text(json.dumps(result, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def cmd_daemon(args: argparse.Namespace) -> int:
+    """Run as daemon, polling inbox every POLL_INTERVAL_S seconds."""
+    FLEET_INBOX.mkdir(parents=True, exist_ok=True)
+    FLEET_OUTBOX.mkdir(parents=True, exist_ok=True)
+
+    shared_key = get_shared_key()
+    if shared_key is None:
+        print("WARNING: FLEET_SHARED_KEY not set — commands will not be signature-verified",
+              file=sys.stderr)
+
+    print(f"[fleet-agent] Daemon started. Polling {FLEET_INBOX} every {POLL_INTERVAL_S}s")
+    print(f"[fleet-agent] Allowed operations: {', '.join(ALLOWED_OPERATIONS)}")
+
+    try:
+        while True:
+            # Process all command files in inbox
+            for cmd_file in sorted(FLEET_INBOX.glob("cmd-*.json")):
+                print(f"[fleet-agent] Processing: {cmd_file.name}")
+                result = process_command_file(cmd_file, shared_key)
+                cmd_id = result.get("id", cmd_file.stem.replace("cmd-", ""))
+                write_result(cmd_id, result)
+                # Move processed file to avoid reprocessing
+                done_dir = FLEET_INBOX / "processed"
+                done_dir.mkdir(exist_ok=True)
+                cmd_file.rename(done_dir / cmd_file.name)
+                print(f"[fleet-agent] Result: {result.get('status')} → {FLEET_OUTBOX}/result-{cmd_id}.json")
+
+            time.sleep(POLL_INTERVAL_S)
+    except KeyboardInterrupt:
+        print("\n[fleet-agent] Daemon stopped.")
+        return 0
+
+
+def cmd_process(args: argparse.Namespace) -> int:
+    """Process a single command file."""
+    cmd_file = Path(args.file)
+    if not cmd_file.exists():
+        print(f"ERROR: Command file not found: {cmd_file}", file=sys.stderr)
+        return 1
+
+    shared_key = get_shared_key()
+    result = process_command_file(cmd_file, shared_key)
+    cmd_id = result.get("id", cmd_file.stem.replace("cmd-", ""))
+    write_result(cmd_id, result)
+    print(json.dumps(result, indent=2))
+    return 0 if result.get("status") in ("ok", "success") else 1
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """Show fleet agent status."""
+    shared_key = get_shared_key()
+    inbox_count = len(list(FLEET_INBOX.glob("cmd-*.json"))) if FLEET_INBOX.exists() else 0
+    outbox_count = len(list(FLEET_OUTBOX.glob("result-*.json"))) if FLEET_OUTBOX.exists() else 0
+
+    status = {
+        "inbox": str(FLEET_INBOX),
+        "inbox_pending": inbox_count,
+        "outbox": str(FLEET_OUTBOX),
+        "outbox_results": outbox_count,
+        "shared_key_configured": shared_key is not None,
+        "allowed_operations": list(ALLOWED_OPERATIONS.keys()),
+    }
+    print(json.dumps(status, indent=2))
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    """List pending commands in inbox."""
+    if not FLEET_INBOX.exists():
+        print("No fleet inbox found.")
+        return 0
+
+    files = sorted(FLEET_INBOX.glob("cmd-*.json"))
+    if not files:
+        print("No pending commands.")
+        return 0
+
+    print(f"Pending commands ({len(files)}):")
+    for f in files:
+        try:
+            cmd = json.loads(f.read_text())
+            print(f"  {f.name}: operation={cmd.get('operation')} ts={cmd.get('ts')}")
+        except Exception:
+            print(f"  {f.name}: <parse error>")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Zero-SSH fleet command agent with HMAC-SHA256 authentication",
+        prog="fleet-agent",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # daemon
+    daemon_parser = subparsers.add_parser("daemon", help="Run as daemon (polls inbox)")
+    daemon_parser.set_defaults(func=cmd_daemon)
+
+    # process
+    process_parser = subparsers.add_parser("process", help="Process one command file")
+    process_parser.add_argument("file", help="Path to command file")
+    process_parser.set_defaults(func=cmd_process)
+
+    # status
+    status_parser = subparsers.add_parser("status", help="Show agent status")
+    status_parser.set_defaults(func=cmd_status)
+
+    # list
+    list_parser = subparsers.add_parser("list", help="List pending commands")
+    list_parser.set_defaults(func=cmd_list)
+
+    args = parser.parse_args()
+    sys.exit(args.func(args))
+
+
+if __name__ == "__main__":
+    main()

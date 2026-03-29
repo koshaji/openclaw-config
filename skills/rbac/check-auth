@@ -36,20 +36,53 @@ AUDIT_DIR = Path.home() / ".openclaw" / "audit"
 AUDIT_DENIALS_FILE = AUDIT_DIR / "auth-denials.jsonl"
 
 
-def log_denial(sender: str, reason: str) -> None:
-    """Append a DENY event to the audit log."""
+def _daily_audit_file() -> Path:
+    """Return path to today's structured audit log: ~/.openclaw/audit/YYYY-MM-DD.jsonl"""
+    today = time.strftime("%Y-%m-%d", time.localtime())
+    return AUDIT_DIR / f"{today}.jsonl"
+
+
+def write_audit_event(sender: str, result: str, reason: str) -> None:
+    """
+    Write an auth event to BOTH:
+      1. The daily structured audit log (~/.openclaw/audit/YYYY-MM-DD.jsonl)
+      2. The denials-only legacy log (~/.openclaw/audit/auth-denials.jsonl)
+
+    Standard audit entry format (from devops/audit-log.md):
+      ts, agent, sender, action, resource, args, result, reason
+    """
     try:
         AUDIT_DIR.mkdir(parents=True, exist_ok=True)
         entry = {
             "ts": int(time.time()),
-            "action": "auth_denied",
+            "agent": "check-auth",
             "sender": sender,
+            "action": "auth_check",
+            "resource": "check-auth",
+            "args": sender,
+            "result": result,
             "reason": reason,
         }
-        with AUDIT_DENIALS_FILE.open("a") as f:
+        # Write to daily structured log
+        with _daily_audit_file().open("a") as f:
             f.write(json.dumps(entry) + "\n")
+        # Also write to denials-only log for backward compatibility
+        if result == "DENY":
+            denial_entry = {
+                "ts": entry["ts"],
+                "action": "auth_denied",
+                "sender": sender,
+                "reason": reason,
+            }
+            with AUDIT_DENIALS_FILE.open("a") as f:
+                f.write(json.dumps(denial_entry) + "\n")
     except Exception as e:
         print(f"WARNING: could not write audit log: {e}", file=sys.stderr)
+
+
+def log_denial(sender: str, reason: str) -> None:
+    """Backward-compat wrapper — use write_audit_event instead."""
+    write_audit_event(sender, "DENY", reason)
 
 
 def load_allowlist(path: Path) -> set[str]:
@@ -77,9 +110,12 @@ def check_auth(identity: str) -> bool:
     try:
         allowlist = load_allowlist(AUTHORIZED_USERS_FILE)
     except Exception as e:
-        print(f"WARNING: could not read authorized-users file: {e}", file=sys.stderr)
-        # Fail open (backward compatible) — could change to fail closed in Phase 3
-        return True
+        # Fail CLOSED: if the file exists but can't be read, that's a security error.
+        # Silently permitting access when the allowlist is unreadable would disable
+        # all access control on disk errors or permission changes.
+        print(f"ERROR: authorized-users file exists but could not be read: {e}", file=sys.stderr)
+        print(f"ERROR: Failing closed (DENY) to preserve security posture", file=sys.stderr)
+        return False
 
     return identity in allowlist
 
@@ -105,11 +141,12 @@ def main() -> int:
     permitted = check_auth(identity)
 
     if permitted:
+        write_audit_event(identity, "PERMIT", "user in allowlist" if AUTHORIZED_USERS_FILE.exists() else "no allowlist configured")
         print("PERMIT")
         return 0
     else:
         reason = "user not in allowlist"
-        log_denial(identity, reason)
+        write_audit_event(identity, "DENY", reason)
         print("DENY")
         return 1
 

@@ -14,6 +14,115 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [2.0.0-alpha] - 2026-03-28 (Phase 2 Complete)
+
+### Critical Bug Fixes
+
+- **C1: watchdog.sh undefined variable bug** — Fixed `$THRESHOLD` reference on line 47
+  to use the correct variable `$FAIL_THRESHOLD`. This was a silent bug that always
+  evaluated the threshold check against an empty string.
+
+- **C2: check-auth fail-closed on read errors** — Changed the exception handler in
+  `skills/rbac/check-auth` to DENY access when the authorized-users file EXISTS but
+  cannot be read. Previously failed open (PERMIT) on any exception. Now:
+  - File missing → PERMIT all (backward-compatible opt-in security)
+  - File exists but unreadable → DENY all (fail-closed — security error)
+  - Empty file → DENY all
+  - Identity in file → PERMIT
+  - Identity not in file → DENY
+
+- **C3: Cost tracker data source verified** — Verified cost-tracker against real session
+  JSONL logs. Schema confirmed: `usage.{input, output, cacheRead, cacheWrite, total}` at
+  the top-level message object alongside `provider` and `model` fields. Added verified
+  schema as inline documentation comment in `skills/cost-tracker/cost-tracker`.
+
+### Major Additions
+
+- **docs/LITELLM_SETUP.md** — Full Phase 2 guide for LiteLLM proxy setup: What is
+  LiteLLM, Docker Compose deployment, per-agent virtual keys, pointing OpenClaw at the
+  proxy, budget caps, dashboard access.
+
+- **skills/security-setup/** — UV script that audits the OpenClaw deployment against
+  `devops/security-baseline.md`. Checks: secrets in .env, dir permissions, gateway bind,
+  service hardening, device inventory. Reports pass/fail with remediation commands.
+
+- **skills/fleet-agent/** — Zero-SSH fleet command agent with HMAC-SHA256 authentication.
+  Implements inbox/outbox pattern from `devops/fleet-agent-security.md`. Operations
+  allowlist-only. Nonce-based replay protection. Full audit logging.
+
+- **RBAC → gateway-restart integration (M2)** — Added `check_authorization()` function to
+  `skills/gateway-restart/gateway-restart`. Reads caller identity from
+  `OPENCLAW_CALLER_IDENTITY` env var, shells out to `check-auth`, aborts with error if
+  DENY. Backward compatible: skip check if no identity configured.
+
+- **Audit log producers (M3)** — `skills/rbac/check-auth` now writes ALL auth events
+  (PERMIT and DENY) to `~/.openclaw/audit/YYYY-MM-DD.jsonl` in the standard format from
+  `devops/audit-log.md`. Added `scripts/audit-write.sh` bash helper that any script can
+  `source` to write audit entries.
+
+- **tests/phase2-validation.sh** — Integration test suite for all Phase 2 deliverables.
+  61 tests covering: critical fixes, stub files, RBAC integration, audit producers, script
+  executability. Includes graceful skip when `uv` is not installed.
+
+- **tests/fixtures/sample-session.jsonl** — Test fixture with real-format session JSONL
+  for cost-tracker testing.
+
+- **tests/fixtures/sample-audit.jsonl** — Test fixture for audit-export testing.
+
+### Stub Files Created (Phase 3/4 Tracking)
+
+All promised-but-missing modules from the gap plan now have stub files with phase tracking
+and full documentation of what will be implemented:
+
+- `skills/security-setup/SKILL.md` (Phase 2, now implemented)
+- `skills/fleet-agent/SKILL.md` (Phase 2, now implemented)
+- `devops/fleet-agent.md` — Fleet agent desired-state spec with allowlist and HMAC details
+- `devops/rbac-config.md` — RBAC configuration spec (Phase 2 allowlist → Phase 3 Casbin)
+- `scripts/session-management/session-ops-weekly-report.sh` (stub)
+- `scripts/session-management/session-store-hygiene.sh` (stub)
+- `scripts/cost-tracker/check-quotas.sh` (stub)
+- `skills/user-router/SKILL.md` (Phase 3 stub)
+- `templates/TEAM.md` — Team configuration template
+- `templates/USERS/USER-template.md` — Per-user profile template
+- `docs/LANGFUSE_SETUP.md` (Phase 3 stub)
+- `docs/AUTHENTIK_SETUP.md` (Phase 3 stub)
+- `docs/AUTHELIA_SETUP.md` (Phase 3 stub)
+- `docs/MULTI_USER_SETUP.md` (Phase 3 stub)
+- `docs/COMPLIANCE_GUIDE.md` (Phase 3 stub)
+- `docs/MCP_FLEET_SETUP.md` (Phase 4 stub)
+- `docs/RUFLO_SETUP.md` (Phase 4 stub)
+- `docs/OPA_SETUP.md` (Phase 4 stub)
+- `skills/fleet-mcp-server/SKILL.md` (Phase 4 stub)
+- `workflows/fleet-commander/AGENT.md` (Phase 4 stub)
+
+### Major Fixes
+
+- **M4: Session management CLI compatibility** — Verified all session management scripts
+  against OpenClaw CLI v2026.3.2. Added CLI compatibility table to README with verified
+  commands: `openclaw sessions list --json`, `openclaw gateway call`, `openclaw cron list`.
+
+- **M5: gateway-restart configurable LOG_DIR** — Made log directory configurable via
+  `OPENCLAW_LOG_DIR` env var with `/tmp/openclaw` as fallback default.
+
+### Minor Fixes
+
+- **m2: Version consistency** — Updated `VERSION` to `2.0.0-alpha`
+
+- **m3: watchdog-notify.sh ExecStartPost fix** — Added
+  `devops/linux/openclaw-watchdog-notify.service` as a separate systemd unit for the
+  watchdog-notify infinite loop. Updated `openclaw-gateway.service` with explanation
+  comment. Running an infinite loop via ExecStartPost blocks systemd from considering
+  the service started.
+
+- **m4: config-rollback.sh date portability** — Added cross-platform date handling using
+  `date --version` to detect GNU vs BSD date, then using the appropriate flag
+  (`-d @epoch` vs `-r epoch`).
+
+- **m5: Fleet command path fix** — Updated `GAP_CLOSING_PLAN.md` to reference the actual
+  file `.claude/commands/fleet.md` instead of the non-existent `devops/fleet.md`.
+
+---
+
 ## [2.0.0-alpha] - 2026-03-28
 
 This is the first release of the Enhanced Fork, based on upstream v0.17.0. All changes

@@ -67,8 +67,15 @@ cmd_list() {
         BASENAME=$(basename "$BACKUP")
         EPOCH=$(echo "$BASENAME" | sed 's/openclaw\.json\.//')
         # Format timestamp if it looks like a unix epoch
+        # Cross-platform: macOS uses `date -r EPOCH`, Linux uses `date -d @EPOCH`
         if [[ "$EPOCH" =~ ^[0-9]+$ ]]; then
-            HUMAN=$(date -r "$EPOCH" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -d "@${EPOCH}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
+            if date --version >/dev/null 2>&1; then
+                # GNU date (Linux)
+                HUMAN=$(date -d "@${EPOCH}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
+            else
+                # BSD date (macOS)
+                HUMAN=$(date -r "$EPOCH" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
+            fi
             echo "  $INDEX. $BASENAME  ($HUMAN)"
         else
             echo "  $INDEX. $BASENAME"

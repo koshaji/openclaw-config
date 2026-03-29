@@ -116,6 +116,30 @@ Add to your health check cron or create a dedicated timer:
 | `~/.openclaw/logs/session-metrics.jsonl` | JSONL metrics snapshots |
 | `~/.openclaw/logs/session-cleanup.log` | Cleanup runs and audit trail |
 
+## CLI Compatibility Notes (M4 — verified 2026-03-28)
+
+These scripts were verified against **OpenClaw CLI v2026.3.2**:
+
+| Command used | CLI Support | Notes |
+|---|---|---|
+| `openclaw sessions list --json` | ✅ Works | Returns JSON with sessions array |
+| `openclaw sessions` | ✅ Works | Default lists sessions (no subcommand needed) |
+| `openclaw gateway call status --json` | ✅ Works | Returns gateway status JSON |
+| `openclaw cron list --json` | ✅ Works | Returns cron jobs JSON |
+
+If a command fails, the scripts fall back gracefully (dry-run, skip, log warning).
+
+**Session JSON schema** (from `openclaw sessions list --json`):
+```json
+{
+  "path": "~/.openclaw/agents/<agent>/sessions/sessions.json",
+  "count": 9,
+  "sessions": [
+    { "id": "...", "createdAt": 1234567890, "updatedAt": 1234567890, "agent": "..." }
+  ]
+}
+```
+
 ## Credits
 
 Session management patterns adapted from

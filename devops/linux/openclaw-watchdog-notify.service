@@ -1,0 +1,43 @@
+[Unit]
+Description=OpenClaw Gateway Watchdog Notifier
+Documentation=https://github.com/koshaji/openclaw-config
+# Start after the gateway is running; restart if the gateway restarts
+After=openclaw-gateway.service
+BindsTo=openclaw-gateway.service
+PartOf=openclaw-gateway.service
+
+# FIXED (issue m3): watchdog-notify.sh is an infinite loop. Running it via
+# ExecStartPost in openclaw-gateway.service would block the gateway from
+# reaching "started" state because ExecStartPost is synchronous.
+#
+# The correct fix is to run it as a separate service unit that:
+#   - starts after the gateway
+#   - stops when the gateway stops (PartOf + BindsTo)
+#   - restarts if it crashes
+#
+# This file replaces the broken ExecStartPost pattern.
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=5
+
+ExecStart=/bin/bash -c '\
+  export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"; \
+  exec bash "$(dirname $(realpath $0))/../../scripts/watchdog-notify.sh"'
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=openclaw-gateway.service
+
+# Installation:
+#
+#   mkdir -p ~/.config/systemd/user/
+#   cp devops/linux/openclaw-watchdog-notify.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable openclaw-watchdog-notify.service
+#
+# The notifier will start/stop automatically with the gateway.
+# Update ExecStart path to the actual scripts/ location on your machine.

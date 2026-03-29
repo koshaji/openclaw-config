@@ -1,0 +1,403 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""
+security-setup — OpenClaw security hardening audit
+
+Checks the deployment against devops/security-baseline.md requirements and
+reports pass/fail for each check with remediation commands.
+
+Usage:
+    security-setup                 # Run all checks (read-only)
+    security-setup --fix           # Apply safe auto-fixes
+    security-setup --json          # JSON output
+    security-setup --check <name>  # Run a specific check
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import stat
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+OPENCLAW_DIR = Path.home() / ".openclaw"
+ENV_FILE = OPENCLAW_DIR / ".env"
+CONFIG_FILE = OPENCLAW_DIR / "openclaw.json"
+AUDIT_DIR = OPENCLAW_DIR / "audit"
+DEVICES_DIR = OPENCLAW_DIR / "devices"
+
+
+@dataclass
+class CheckResult:
+    name: str
+    status: str  # "pass", "fail", "warn", "skip"
+    message: str
+    remediation: str = ""
+
+    @property
+    def icon(self) -> str:
+        return {"pass": "✅", "fail": "❌", "warn": "⚠️ ", "skip": "⏭️ "}.get(self.status, "❓")
+
+
+@dataclass
+class SecurityReport:
+    checks: list[CheckResult] = field(default_factory=list)
+
+    @property
+    def pass_count(self) -> int:
+        return sum(1 for c in self.checks if c.status == "pass")
+
+    @property
+    def fail_count(self) -> int:
+        return sum(1 for c in self.checks if c.status == "fail")
+
+    @property
+    def warn_count(self) -> int:
+        return sum(1 for c in self.checks if c.status == "warn")
+
+    def add(self, result: CheckResult) -> None:
+        self.checks.append(result)
+
+
+def check_secrets_in_env() -> CheckResult:
+    """Check 1: API keys should be in .env, not in openclaw.json."""
+    name = "secrets_in_env"
+
+    if not CONFIG_FILE.exists():
+        return CheckResult(name, "skip", "openclaw.json not found — nothing to check")
+
+    try:
+        config = json.loads(CONFIG_FILE.read_text())
+    except Exception as e:
+        return CheckResult(name, "warn", f"Could not parse openclaw.json: {e}")
+
+    # Common API key patterns to look for in config
+    sensitive_patterns = [
+        "sk-ant-", "sk-", "API_KEY", "apiKey", "api_key",
+        "ANTHROPIC", "OPENAI", "secret", "token", "password",
+    ]
+
+    config_str = json.dumps(config).lower()
+    secrets_found = []
+
+    # Check for actual secret-looking values (not just key names)
+    def scan_dict(d: dict, path: str = "") -> None:
+        for k, v in d.items():
+            current_path = f"{path}.{k}" if path else k
+            if isinstance(v, str) and len(v) > 20:
+                # Looks like it might be a secret value
+                v_lower = v.lower()
+                if any(p.lower() in v_lower or p.lower() in k.lower()
+                       for p in ["sk-ant-", "sk-", "key-", "secret", "token"]):
+                    if not v.startswith("${") and not v.startswith("$"):
+                        secrets_found.append(current_path)
+            elif isinstance(v, dict):
+                scan_dict(v, current_path)
+
+    scan_dict(config)
+
+    if secrets_found:
+        return CheckResult(
+            name, "fail",
+            f"Possible secrets in openclaw.json: {', '.join(secrets_found[:3])}",
+            "Move secrets to ~/.openclaw/.env and use ${ENV_VAR} syntax in config"
+        )
+
+    return CheckResult(name, "pass", "No obvious secrets found in openclaw.json")
+
+
+def check_openclaw_dir_permissions() -> CheckResult:
+    """Check 2: ~/.openclaw should be chmod 700."""
+    name = "openclaw_dir_permissions"
+
+    if not OPENCLAW_DIR.exists():
+        return CheckResult(name, "skip", f"{OPENCLAW_DIR} not found")
+
+    mode = OPENCLAW_DIR.stat().st_mode
+    perms = stat.S_IMODE(mode)
+
+    if perms == 0o700:
+        return CheckResult(name, "pass", f"~/.openclaw has correct permissions: 700")
+    elif perms & 0o077:  # Group or world readable/writable/executable
+        actual = oct(perms)
+        return CheckResult(
+            name, "fail",
+            f"~/.openclaw permissions are too permissive: {actual} (should be 700)",
+            "Run: chmod 700 ~/.openclaw"
+        )
+    else:
+        actual = oct(perms)
+        return CheckResult(name, "warn", f"~/.openclaw permissions: {actual} (recommended: 700)")
+
+
+def check_env_file_permissions() -> CheckResult:
+    """Check 3: ~/.openclaw/.env should be chmod 600."""
+    name = "env_file_permissions"
+
+    if not ENV_FILE.exists():
+        return CheckResult(name, "warn",
+                           f"{ENV_FILE} not found — create it with API keys",
+                           f"Run: touch {ENV_FILE} && chmod 600 {ENV_FILE}")
+
+    mode = ENV_FILE.stat().st_mode
+    perms = stat.S_IMODE(mode)
+
+    if perms == 0o600:
+        return CheckResult(name, "pass", f"~/.openclaw/.env has correct permissions: 600")
+    elif perms & 0o077:
+        actual = oct(perms)
+        return CheckResult(
+            name, "fail",
+            f"~/.openclaw/.env permissions are too permissive: {actual} (should be 600)",
+            "Run: chmod 600 ~/.openclaw/.env"
+        )
+    else:
+        actual = oct(perms)
+        return CheckResult(name, "warn", f"~/.openclaw/.env permissions: {actual} (recommended: 600)")
+
+
+def check_gateway_bind() -> CheckResult:
+    """Check 4: Gateway should be bound to loopback, not 0.0.0.0."""
+    name = "gateway_bind"
+
+    if not CONFIG_FILE.exists():
+        return CheckResult(name, "skip", "openclaw.json not found")
+
+    try:
+        config = json.loads(CONFIG_FILE.read_text())
+    except Exception as e:
+        return CheckResult(name, "warn", f"Could not parse openclaw.json: {e}")
+
+    gateway_config = config.get("gateway", {})
+    bind = gateway_config.get("bind", "loopback")
+
+    if bind in ("loopback", "127.0.0.1"):
+        return CheckResult(name, "pass", f"Gateway bind: {bind} (loopback only ✓)")
+    elif bind in ("lan", "tailnet", "auto"):
+        return CheckResult(name, "warn",
+                           f"Gateway bind: {bind} — accessible on network (intentional?)",
+                           "If unintentional: openclaw config set gateway.bind loopback")
+    else:
+        return CheckResult(
+            name, "fail",
+            f"Gateway bind: {bind} — may be exposed publicly",
+            "Run: openclaw config set gateway.bind loopback"
+        )
+
+
+def check_service_hardening() -> CheckResult:
+    """Check 5: Service files should have ThrottleInterval/RestartSec."""
+    name = "service_hardening"
+
+    # Check macOS plist
+    mac_plist_dir = Path.home() / "Library" / "LaunchAgents"
+    gateway_plist = mac_plist_dir / "ai.openclaw.gateway.plist"
+
+    # Check Linux systemd
+    systemd_dir = Path.home() / ".config" / "systemd" / "user"
+    gateway_service = systemd_dir / "openclaw-gateway.service"
+
+    if gateway_plist.exists():
+        content = gateway_plist.read_text()
+        if "ThrottleInterval" in content:
+            return CheckResult(name, "pass",
+                               "macOS gateway plist has ThrottleInterval (crash recovery)")
+        else:
+            return CheckResult(
+                name, "fail",
+                "macOS gateway plist missing ThrottleInterval (risk: exponential backoff on crash)",
+                f"Add <key>ThrottleInterval</key><integer>5</integer> to {gateway_plist}"
+            )
+    elif gateway_service.exists():
+        content = gateway_service.read_text()
+        if "RestartSec=5" in content and "StartLimitIntervalSec=0" in content:
+            return CheckResult(name, "pass",
+                               "Linux gateway service has RestartSec+StartLimitIntervalSec (crash recovery)")
+        elif "RestartSec" in content:
+            return CheckResult(name, "warn",
+                               "Linux gateway service has RestartSec but missing StartLimitIntervalSec=0")
+        else:
+            return CheckResult(
+                name, "fail",
+                "Linux gateway service missing RestartSec (risk: exponential backoff on crash)",
+                "Add RestartSec=5 and StartLimitIntervalSec=0 to the service file"
+            )
+    else:
+        return CheckResult(name, "skip",
+                           "No service file found (gateway not installed as service)")
+
+
+def check_device_inventory() -> CheckResult:
+    """Check 6: List paired devices, flag stale entries."""
+    name = "device_inventory"
+
+    try:
+        result = subprocess.run(
+            ["openclaw", "devices", "list", "--json"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode != 0:
+            return CheckResult(name, "warn",
+                               "Could not list devices (openclaw devices list failed)")
+
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return CheckResult(name, "warn", "Could not parse devices output as JSON")
+
+        devices = data if isinstance(data, list) else data.get("devices", [])
+        total = len(devices)
+
+        if total == 0:
+            return CheckResult(name, "pass", "No paired devices found")
+
+        # Count stale devices (not seen in >30 days)
+        import time
+        now = time.time()
+        stale_days = 30
+        stale_threshold = now - (stale_days * 86400)
+
+        stale = []
+        for d in devices:
+            last_seen = d.get("lastSeen") or d.get("last_seen") or 0
+            if isinstance(last_seen, str):
+                # Try to parse ISO timestamp
+                try:
+                    from datetime import datetime
+                    dt = datetime.fromisoformat(last_seen.replace("Z", "+00:00"))
+                    last_seen = dt.timestamp()
+                except Exception:
+                    last_seen = 0
+            if last_seen and last_seen < stale_threshold:
+                stale.append(d.get("name") or d.get("id", "unknown"))
+
+        if stale:
+            return CheckResult(
+                name, "warn",
+                f"{total} paired device(s), {len(stale)} stale (>{stale_days}d): {', '.join(stale[:3])}",
+                "Run: openclaw devices list && openclaw devices revoke <id>"
+            )
+
+        return CheckResult(name, "pass", f"{total} paired device(s), none stale")
+
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return CheckResult(name, "skip",
+                           "openclaw CLI not available for device check")
+
+
+def run_all_checks(fix: bool = False) -> SecurityReport:
+    """Run all security checks and return a report."""
+    report = SecurityReport()
+
+    checks = [
+        check_secrets_in_env,
+        check_openclaw_dir_permissions,
+        check_env_file_permissions,
+        check_gateway_bind,
+        check_service_hardening,
+        check_device_inventory,
+    ]
+
+    for check_fn in checks:
+        try:
+            result = check_fn()
+        except Exception as e:
+            result = CheckResult(check_fn.__name__, "warn", f"Check failed with error: {e}")
+        report.add(result)
+
+        if fix and result.status == "fail" and result.remediation:
+            # Auto-fix: only apply safe, non-destructive fixes
+            if "chmod 700" in result.remediation:
+                try:
+                    OPENCLAW_DIR.chmod(0o700)
+                    result.status = "pass"
+                    result.message += " [AUTO-FIXED]"
+                except Exception as e:
+                    result.message += f" [AUTO-FIX FAILED: {e}]"
+            elif "chmod 600" in result.remediation and ".env" in result.remediation:
+                try:
+                    ENV_FILE.chmod(0o600)
+                    result.status = "pass"
+                    result.message += " [AUTO-FIXED]"
+                except Exception as e:
+                    result.message += f" [AUTO-FIX FAILED: {e}]"
+
+    return report
+
+
+def print_report(report: SecurityReport, verbose: bool = False) -> None:
+    """Print a human-readable security report."""
+    print("\n🔒 OpenClaw Security Audit")
+    print("=" * 50)
+
+    for check in report.checks:
+        print(f"\n{check.icon} {check.status.upper():4}  {check.name}")
+        print(f"         {check.message}")
+        if check.remediation and check.status in ("fail", "warn"):
+            print(f"         💊 Fix: {check.remediation}")
+
+    print("\n" + "=" * 50)
+    print(f"Results: ✅ {report.pass_count} passed  "
+          f"❌ {report.fail_count} failed  "
+          f"⚠️  {report.warn_count} warnings")
+
+    if report.fail_count > 0:
+        print(f"\n❌ {report.fail_count} security issue(s) require attention.")
+    elif report.warn_count > 0:
+        print(f"\n⚠️  {report.warn_count} warning(s) to review.")
+    else:
+        print("\n✅ All checks passed.")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="OpenClaw security hardening audit",
+        prog="security-setup",
+    )
+    parser.add_argument("--fix", action="store_true",
+                        help="Apply safe auto-fixes")
+    parser.add_argument("--json", action="store_true",
+                        help="Output as JSON")
+    parser.add_argument("--check", type=str, default=None,
+                        help="Run a specific check by name")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Verbose output")
+
+    args = parser.parse_args()
+
+    report = run_all_checks(fix=args.fix)
+
+    if args.json:
+        output = {
+            "checks": [
+                {
+                    "name": c.name,
+                    "status": c.status,
+                    "message": c.message,
+                    "remediation": c.remediation,
+                }
+                for c in report.checks
+            ],
+            "summary": {
+                "pass": report.pass_count,
+                "fail": report.fail_count,
+                "warn": report.warn_count,
+            }
+        }
+        print(json.dumps(output, indent=2))
+    else:
+        print_report(report, verbose=args.verbose)
+
+    return 1 if report.fail_count > 0 else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

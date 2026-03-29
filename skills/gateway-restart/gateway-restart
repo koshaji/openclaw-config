@@ -9,6 +9,7 @@ Graceful OpenClaw gateway restart — waits for active queries and cron jobs to 
 
 import argparse
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -19,7 +20,48 @@ from pathlib import Path
 ACTIVE_SESSION_THRESHOLD_MS = 60_000  # Sessions updated within 60s considered active
 POLL_INTERVAL_S = 5
 DEFAULT_TIMEOUT_S = 300
-LOG_DIR = Path("/tmp/openclaw")
+# Log dir: configurable via env var, falls back to /tmp/openclaw
+LOG_DIR = Path(os.environ.get("OPENCLAW_LOG_DIR", "/tmp/openclaw"))
+
+
+def check_authorization(identity: str | None = None) -> bool:
+    """
+    Run the check-auth pre-flight gate before any restart action.
+
+    If an identity is provided (e.g., from OPENCLAW_CALLER_IDENTITY env var),
+    the RBAC allowlist is checked. If denied, the restart is aborted.
+
+    If no identity is provided, the check is skipped (backward compatible).
+    The check-auth script must be on PATH or in the same skill directory.
+    """
+    if not identity:
+        # No identity provided — skip RBAC check (backward compatible)
+        return True
+
+    # Find check-auth: prefer sibling in ../rbac/, then PATH
+    script_dir = Path(__file__).parent
+    check_auth_path = script_dir.parent / "rbac" / "check-auth"
+    if not check_auth_path.exists():
+        # Fall back to PATH
+        check_auth_path = "check-auth"
+
+    try:
+        result = subprocess.run(
+            [str(check_auth_path), identity],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            print(f"[RBAC] PERMIT: {identity}")
+            return True
+        else:
+            print(f"[RBAC] DENY: {identity} — access denied by allowlist", file=sys.stderr)
+            return False
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        # check-auth unavailable — fail open (RBAC is optional, not blocking)
+        print(f"WARNING: check-auth unavailable ({e}), skipping RBAC check", file=sys.stderr)
+        return True
 
 
 def run_cmd(args: list[str], remote: str | None = None, timeout: int = 15) -> subprocess.CompletedProcess:
@@ -321,6 +363,13 @@ def main() -> None:
     status_parser.set_defaults(func=cmd_status)
 
     args = parser.parse_args()
+
+    # RBAC pre-flight: check caller identity if provided via environment
+    caller_identity = os.environ.get("OPENCLAW_CALLER_IDENTITY")
+    if not check_authorization(caller_identity):
+        print("ERROR: Access denied by RBAC check. Set OPENCLAW_CALLER_IDENTITY to your identity.")
+        sys.exit(1)
+
     sys.exit(args.func(args))
 
 
